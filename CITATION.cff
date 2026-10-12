@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+message: "A NanoVer extensiosn for viewing electric field lines in VR."
+title: "fieldlines"
+abstract: "A NanoVer extensiosn for viewing electric field lines in VR."
+authors:
+  - name: "Thomas Regan"
+version: 0.1.0
+license: "MIT"
+repository-code: "https://github.com/BristolChemVR/nanover-extensions-fieldlines"
+keywords:
+  - "python"
