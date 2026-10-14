@@ -4,9 +4,18 @@ from typing import Any
 
 import numpy as np
 import pytest
+from scipy.spatial.transform import Rotation
 
 from nanover_extensions.fieldlines import core
-from nanover_extensions.fieldlines.core import MV_PER_CM, CoulombField, bond_field, trace
+from nanover_extensions.fieldlines.core import (
+    MV_PER_CM,
+    VOLT_ANGSTROM,
+    CoulombField,
+    GridField,
+    Seeds,
+    bond_field,
+    trace,
+)
 
 ORIGIN = np.zeros((1, 3))
 
@@ -243,6 +252,149 @@ def test_line_ends_where_the_cutoff_leaves_no_field() -> None:
     assert lines.strengths[-1] == 0.0
 
 
+# Potential
+
+
+@pytest.mark.parametrize("cutoff", [None, 50.0])
+def test_point_charge_potential(cutoff: float | None) -> None:
+    field = CoulombField(ORIGIN, [-2.0], cutoff=cutoff, dielectric=4.0, debye_length=8.0)
+    potential = field.potential([[0.0, 5.0, 0.0], [0.0, 0.0, 0.0]])
+    assert potential == pytest.approx([-2.0 * VOLT_ANGSTROM * np.exp(-5.0 / 8.0) / 20.0, 0.0])
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{}, {"debye_length": 8.0}, {"cutoff": 6.0}, {"dielectric": 4.0, "distance_dielectric": True}],
+)
+def test_field_is_minus_the_gradient_of_the_potential(kwargs: dict[str, Any]) -> None:
+    positions, charges, points = random_cloud()
+    field = CoulombField(positions, charges, **kwargs)
+    # Keep away from charges and from the cutoff, where the potential jumps.
+    distances = np.linalg.norm(points[:, None] - positions[None], axis=2)
+    if "cutoff" in kwargs:
+        distances = np.minimum(distances, np.abs(distances - kwargs["cutoff"]))
+    points = points[distances.min(axis=1) > 0.2]
+    h = 1e-4
+    gradient = np.stack(
+        [
+            (field.potential(points + h * axis) - field.potential(points - h * axis)) / (2 * h)
+            for axis in np.eye(3)
+        ],
+        axis=1,
+    )
+    vectors, _ = field.evaluate(points)
+    # 1 V/A is 100 MV/cm.
+    assert vectors == pytest.approx(-100.0 * gradient, rel=1e-5, abs=1e-6)
+
+
+def test_potential_is_the_same_in_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
+    positions, charges, points = random_cloud()
+    field = CoulombField(positions, charges)
+    whole = field.potential(points)
+    monkeypatch.setattr(core, "_MAX_DENSE_PAIRS", 7 * len(positions))
+    assert field.potential(points) == pytest.approx(whole)
+
+
+# Grid
+
+
+def grid_and_exact(**kwargs: Any) -> tuple[GridField, CoulombField, np.ndarray]:  # noqa: ANN401
+    """Return the same random charges on a grid and summed directly, and probe points.
+
+    The probe points are more than 3 angstrom from every charge.
+    """
+    rng = np.random.default_rng(2)
+    positions = rng.uniform(-6, 6, size=(40, 3))
+    charges = rng.uniform(-1, 1, size=40)
+    points = rng.uniform(-12, 12, size=(400, 3))
+    nearest = np.linalg.norm(points[:, None] - positions[None], axis=2).min(axis=1)
+    points = points[nearest > 3.0]
+    grid = GridField(positions, charges, **kwargs)
+    exact_kwargs = {key: value for key, value in kwargs.items() if key != "spacing"}
+    return grid, CoulombField(positions, charges, **exact_kwargs), points
+
+
+def relative_errors(grid: GridField, exact: CoulombField, points: np.ndarray) -> np.ndarray:
+    got, _ = grid.evaluate(points)
+    expected, _ = exact.evaluate(points)
+    return np.asarray(np.linalg.norm(got - expected, axis=1) / np.linalg.norm(expected, axis=1))
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "median", "p90"),
+    [
+        ({}, 0.02, 0.06),
+        ({"debye_length": 8.0}, 0.02, 0.06),
+        ({"dielectric": 4.0}, 0.02, 0.06),
+        # A 1 / r^2 potential is steeper, so central differences are coarser.
+        ({"dielectric": 0.5, "distance_dielectric": True}, 0.04, 0.15),
+    ],
+)
+def test_grid_matches_the_direct_sum_away_from_charges(
+    kwargs: dict[str, Any],
+    median: float,
+    p90: float,
+) -> None:
+    grid, exact, points = grid_and_exact(**kwargs)
+    errors = relative_errors(grid, exact, points)
+    assert np.median(errors) < median
+    assert np.percentile(errors, 90) < p90
+    assert grid.evaluate(points)[1] == pytest.approx(exact.evaluate(points)[1])
+    expected = exact.potential(points)
+    potential_errors = np.abs(grid.potential(points) - expected)
+    assert np.median(potential_errors) < 0.01 * np.median(np.abs(expected))
+
+
+def test_finer_grid_is_more_accurate() -> None:
+    coarse = np.median(relative_errors(*grid_and_exact(spacing=1.0)))
+    fine = np.median(relative_errors(*grid_and_exact(spacing=0.5)))
+    assert fine < coarse / 2
+
+
+def test_grid_reaches_the_margin_and_is_zero_beyond() -> None:
+    grid = GridField(ORIGIN, [1.0], spacing=0.25, margin=5.0)
+    vectors, nearest = grid.evaluate([[4.5, 0, 0], [0, 0, -4.5], [8.0, 0, 0], [0, -30.0, 0]])
+    assert vectors[0, 0] == pytest.approx(MV_PER_CM / 4.5**2, rel=0.02)
+    assert vectors[1, 2] == pytest.approx(-MV_PER_CM / 4.5**2, rel=0.02)
+    assert vectors[2:] == pytest.approx(0.0)
+    assert grid.potential([[8.0, 0, 0]]) == pytest.approx([0.0])
+    assert nearest == pytest.approx([4.5, 4.5, 8.0, 30.0])
+
+
+def test_grid_reaches_the_covered_points() -> None:
+    plain = GridField(ORIGIN, [1.0], margin=2.0)
+    covered = GridField(ORIGIN, [1.0], margin=2.0, cover=[[20.0, 0, 0]])
+    assert covered.shape[0] == plain.shape[0] + 20
+    assert covered.shape[1:] == plain.shape[1:]
+    vectors, _ = covered.evaluate([[20.0, 0, 0]])
+    assert vectors[0, 0] == pytest.approx(MV_PER_CM / 20.0**2, rel=0.01)
+
+
+def test_grid_kernel_is_reused_for_the_same_shape() -> None:
+    core._kernel_spectrum.cache_clear()
+    GridField(ORIGIN, [1.0])
+    GridField([[1.0, 2.0, 3.0]], [-1.0])
+    assert core._kernel_spectrum.cache_info().hits == 1
+
+
+def test_line_traced_on_a_grid_follows_the_exact_one() -> None:
+    seeds = [[1.5, 0.0, 0.0]]
+    exact = trace(dipole(), seeds, step=0.1, max_steps=200)
+    grid = GridField([[0, 0, 2], [0, 0, -2]], [1.0, -1.0], spacing=0.5)
+    gridded = trace(grid, seeds, step=0.1, max_steps=200)
+    # Both run from the positive to the negative charge, close together.
+    ends = np.linalg.norm(gridded.points[[0, -1]] - exact.points[[0, -1]], axis=1)
+    assert ends.max() < 0.5
+    middle = gridded.points[np.abs(gridded.points[:, 2]).argmin()]
+    assert middle == pytest.approx(exact.points[np.abs(exact.points[:, 2]).argmin()], abs=0.2)
+
+
+def test_line_ends_at_the_edge_of_the_grid() -> None:
+    lines = trace(GridField(ORIGIN, [1.0], margin=4.0), [[3.0, 0.0, 0.0]], max_steps=40)
+    assert 4.0 < lines.points[-1, 0] < 5.5
+    assert lines.strengths[-1] == 0.0
+
+
 # Edge cases
 
 
@@ -255,11 +407,19 @@ def test_dense_sum_is_the_same_in_chunks(monkeypatch: pytest.MonkeyPatch) -> Non
         assert got == pytest.approx(expected)
 
 
-@pytest.mark.parametrize("cutoff", [None, 5.0])
-def test_no_points(cutoff: float | None) -> None:
-    vectors, nearest = CoulombField(ORIGIN, [1.0], cutoff=cutoff).evaluate(np.zeros((0, 3)))
+@pytest.mark.parametrize(
+    "field",
+    [
+        CoulombField(ORIGIN, [1.0]),
+        CoulombField(ORIGIN, [1.0], cutoff=5.0),
+        GridField(ORIGIN, [1.0]),
+    ],
+)
+def test_no_points(field: core.Field) -> None:
+    vectors, nearest = field.evaluate(np.zeros((0, 3)))
     assert vectors.shape == (0, 3)
     assert nearest.shape == (0,)
+    assert field.potential(np.zeros((0, 3))).shape == (0,)
 
 
 def test_no_seeds() -> None:
@@ -308,6 +468,18 @@ def test_invalid_field_arguments(
 ) -> None:
     with pytest.raises(ValueError, match="must|required"):
         CoulombField(positions, charges, **kwargs)
+    if "cutoff" not in kwargs:
+        with pytest.raises(ValueError, match="must|required"):
+            GridField(positions, charges, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"spacing": 0.0}, {"margin": -1.0}, {"cover": [1.0, 0.0, 0.0]}],
+)
+def test_invalid_grid_arguments(kwargs: dict[str, Any]) -> None:
+    with pytest.raises(ValueError, match="must"):
+        GridField(ORIGIN, [1.0], **kwargs)
 
 
 @pytest.mark.parametrize(
@@ -326,3 +498,58 @@ def test_invalid_trace_arguments(seeds: list[float], kwargs: dict[str, Any]) -> 
 def test_invalid_points() -> None:
     with pytest.raises(ValueError, match="points"):
         CoulombField(ORIGIN, [1.0]).evaluate([1.0, 0.0, 0.0])
+
+
+# Seeds that follow atoms
+
+
+def rigid_motion(points: np.ndarray) -> np.ndarray:
+    """Turn and shift points as a whole."""
+    return np.asarray(Rotation.from_rotvec([0.4, -1.1, 0.7]).apply(points) + [2.0, -5.0, 3.0])
+
+
+def test_seeds_turn_and_move_with_their_atoms() -> None:
+    rng = np.random.default_rng(2)
+    positions = rng.uniform(-10, 10, size=(40, 3))
+    atoms = np.arange(5, 40)
+    points = rng.uniform(-12, 12, size=(25, 3))
+    seeds = Seeds.anchor(points, np.arange(25), positions, atoms, 25)
+    assert len(seeds) == 25
+    assert seeds.follow(positions) == pytest.approx(points)
+    assert seeds.follow(rigid_motion(positions)) == pytest.approx(rigid_motion(points))
+    # Each seed follows its nearest atom first, and only atoms it was allowed.
+    nearest = np.linalg.norm(points[:, None] - positions[None, atoms], axis=2).argmin(axis=1)
+    assert seeds.atoms[:, 0].tolist() == atoms[nearest].tolist()
+    assert set(seeds.atoms.ravel()) <= set(atoms)
+    assert len(set(map(tuple, np.sort(seeds.atoms, axis=1)))) > 1
+
+
+@pytest.mark.parametrize(
+    "positions",
+    [
+        np.array([[1.0, 2.0, 3.0]]),
+        np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]]),
+        np.array([[0.0, 0.0, 0.0], [0.05, 0.0, 0.0]]),
+    ],
+)
+def test_seeds_only_follow_the_first_atom_if_the_others_fix_no_direction(
+    positions: np.ndarray,
+) -> None:
+    points = np.array([[0.5, 4.0, -1.0], [-3.0, 0.2, 2.0]])
+    seeds = Seeds.anchor(points, [7, 9], positions, np.arange(len(positions)), 10)
+    moved = rigid_motion(positions)
+    first = seeds.atoms[:, 0]
+    assert seeds.follow(moved) == pytest.approx(moved[first] + points - positions[first])
+    assert seeds.ids.tolist() == [7, 9]
+    assert seeds.next_id == 10
+
+
+def test_no_seeds_to_anchor() -> None:
+    seeds = Seeds.anchor(np.zeros((0, 3)), [], ORIGIN, np.array([0]), 4)
+    assert len(seeds) == 0
+    assert seeds.follow(ORIGIN).shape == (0, 3)
+
+
+def test_seeds_need_atoms_to_follow() -> None:
+    with pytest.raises(ValueError, match="at least one atom"):
+        Seeds.anchor([[1.0, 0.0, 0.0]], [0], ORIGIN, np.zeros(0, dtype=np.intp), 1)
