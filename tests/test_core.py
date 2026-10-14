@@ -1,5 +1,7 @@
 """Tests for the Coulomb field and field line tracer."""
 
+from typing import Any
+
 import numpy as np
 import pytest
 
@@ -9,7 +11,7 @@ from nanover_extensions.fieldlines.core import MV_PER_CM, CoulombField, bond_fie
 ORIGIN = np.zeros((1, 3))
 
 
-def dipole(separation: float = 4.0, **kwargs: float) -> CoulombField:
+def dipole(separation: float = 4.0, **kwargs: Any) -> CoulombField:  # noqa: ANN401
     """Return +1 at +z and -1 at -z, `separation` apart."""
     half = separation / 2
     return CoulombField([[0, 0, half], [0, 0, -half]], [1.0, -1.0], **kwargs)
@@ -111,6 +113,66 @@ def test_bond_field_projects_on_the_bond_direction() -> None:
     assert bond_field(field, [0, 0, 4.5], [0, 0, 5.5]) == pytest.approx(on_axis)
     assert bond_field(field, [0, 0, 5.5], [0, 0, 4.5]) == pytest.approx(-on_axis)
     assert bond_field(field, [-0.5, 0, 5], [0.5, 0, 5]) == pytest.approx(0.0)
+
+
+def test_bond_field_leaves_out_the_bond_atoms() -> None:
+    # A bond from z = 0 to z = 1 carrying its own charges, and one outside charge at z = 5.
+    field = CoulombField([[0, 0, 0], [0, 0, 1], [0, 0, 5]], [0.5, -0.5, 1.0])
+    outside = -MV_PER_CM / 4.5**2
+    assert bond_field(field, [0, 0, 0], [0, 0, 1]) == pytest.approx(outside)
+    own = MV_PER_CM * (0.5 / 0.5**2 + 0.5 / 0.5**2)
+    assert bond_field(field, [0, 0, 0], [0, 0, 1], include_self=True) == pytest.approx(
+        outside + own,
+    )
+
+
+def test_bond_field_of_a_bond_alone_is_zero() -> None:
+    assert bond_field(dipole(), [0, 0, 2], [0, 0, -2]) == 0.0
+
+
+def test_without_removes_charges_and_keeps_settings() -> None:
+    field = CoulombField([[0, 0, 0], [5, 0, 0]], [1.0, 2.0], cutoff=9.0, dielectric=2.0)
+    smaller = field.without([1])
+    assert smaller.positions.tolist() == [[0.0, 0.0, 0.0]]
+    assert smaller.charges.tolist() == [1.0]
+    assert (smaller.cutoff, smaller.dielectric) == (9.0, 2.0)
+    assert field.charges.tolist() == [1.0, 2.0]
+
+
+# Dielectric
+
+
+def test_constant_dielectric_divides_the_field() -> None:
+    positions, charges, points = random_cloud()
+    bare, _ = CoulombField(positions, charges).evaluate(points)
+    damped, _ = CoulombField(positions, charges, dielectric=4.0).evaluate(points)
+    assert damped == pytest.approx(bare / 4.0)
+
+
+@pytest.mark.parametrize("debye_length", [None, 8.0])
+@pytest.mark.parametrize("distance", [1.0, 3.0, 10.0])
+def test_distance_dielectric_is_minus_the_potential_gradient(
+    debye_length: float | None,
+    distance: float,
+) -> None:
+    def potential(r: float) -> float:
+        screening = 1.0 if debye_length is None else np.exp(-r / debye_length)
+        return MV_PER_CM * screening / (4.0 * r * r)
+
+    field = CoulombField(ORIGIN, [1.0], dielectric=4.0, distance_dielectric=True,
+                         debye_length=debye_length)  # fmt: skip
+    vectors, _ = field.evaluate([[distance, 0, 0]])
+    h = 1e-5
+    gradient = (potential(distance + h) - potential(distance - h)) / (2 * h)
+    assert vectors[0, 0] == pytest.approx(-gradient, rel=1e-6)
+    assert vectors[0, 1:] == pytest.approx(0.0)
+
+
+def test_distance_dielectric_falls_off_as_inverse_cube() -> None:
+    field = CoulombField(ORIGIN, [1.0], dielectric=4.0, distance_dielectric=True)
+    vectors, _ = field.evaluate([[2.0, 0, 0], [4.0, 0, 0]])
+    assert vectors[0, 0] == pytest.approx(2 * MV_PER_CM / (4.0 * 2.0**3))
+    assert vectors[0, 0] / vectors[1, 0] == pytest.approx(8.0)
 
 
 # Screening
@@ -236,12 +298,13 @@ def test_inputs_are_not_modified() -> None:
         (np.zeros((0, 3)), [], {}),
         ([[0.0, 0.0, 0.0]], [1.0], {"debye_length": 0.0}),
         ([[0.0, 0.0, 0.0]], [1.0], {"cutoff": -1.0}),
+        ([[0.0, 0.0, 0.0]], [1.0], {"dielectric": 0.0}),
     ],
 )
 def test_invalid_field_arguments(
-    positions: object,
-    charges: object,
-    kwargs: dict[str, float],
+    positions: Any,  # noqa: ANN401
+    charges: Any,  # noqa: ANN401
+    kwargs: dict[str, Any],
 ) -> None:
     with pytest.raises(ValueError, match="must|required"):
         CoulombField(positions, charges, **kwargs)
@@ -255,7 +318,7 @@ def test_invalid_field_arguments(
         ([[1.0, 0.0, 0.0]], {"max_steps": -1}),
     ],
 )
-def test_invalid_trace_arguments(seeds: list[float], kwargs: dict[str, float]) -> None:
+def test_invalid_trace_arguments(seeds: list[float], kwargs: dict[str, Any]) -> None:
     with pytest.raises(ValueError, match="must"):
         trace(CoulombField(ORIGIN, [1.0]), seeds, **kwargs)
 

@@ -2,7 +2,7 @@
 
 Units: positions in angstrom, charges in elementary charges, fields in MV/cm.
 The field is a plain Coulomb sum over fixed point charges, optionally with
-Debye-Hueckel screening and a distance cutoff.
+Debye-Hueckel screening, a dielectric constant and a distance cutoff.
 """
 
 from __future__ import annotations
@@ -26,6 +26,9 @@ MV_PER_CM = 1439.9645
 _MAX_DENSE_PAIRS = 2_000_000
 """Upper bound on point-charge pairs held in memory at once when no cutoff is set."""
 
+_SAME_POINT = 1e-6
+"""Charges closer than this (angstrom) to a bond atom are taken to be that atom."""
+
 
 def _as_vectors(values: npt.ArrayLike, name: str) -> FloatArray:
     """Convert to a float (N, 3) array, rejecting any other shape."""
@@ -44,6 +47,11 @@ class CoulombField:
         debye_length: Debye-Hueckel screening length in angstrom. No screening if None.
         cutoff: Charges further than this from a point (angstrom) do not contribute to
             the field there. All charges contribute if None.
+        dielectric: Relative permittivity of the medium. With `distance_dielectric`,
+            the slope `k` of a permittivity `k * r` with `r` in angstrom.
+        distance_dielectric: Use the distance-dependent permittivity `dielectric * r`.
+            The field is then minus the gradient of the potential `q / (k r^2)`, which
+            is twice what dividing the bare field by `k r` would give.
     """
 
     def __init__(
@@ -53,6 +61,8 @@ class CoulombField:
         *,
         debye_length: float | None = None,
         cutoff: float | None = None,
+        dielectric: float = 1.0,
+        distance_dielectric: bool = False,
     ) -> None:
         self._positions = _as_vectors(positions, "positions")
         self._charges = np.asarray(charges, dtype=np.float64)
@@ -67,10 +77,44 @@ class CoulombField:
             raise ValueError(f"`debye_length` must be positive, not {debye_length}.")
         if cutoff is not None and cutoff <= 0:
             raise ValueError(f"`cutoff` must be positive, not {cutoff}.")
+        if dielectric <= 0:
+            raise ValueError(f"`dielectric` must be positive, not {dielectric}.")
 
         self.debye_length = debye_length
         self.cutoff = cutoff
+        self.dielectric = dielectric
+        self.distance_dielectric = distance_dielectric
         self._tree = None if cutoff is None else cKDTree(self._positions)
+
+    @property
+    def positions(self) -> FloatArray:
+        """Charge positions in angstrom, shape (N, 3)."""
+        return self._positions
+
+    @property
+    def charges(self) -> FloatArray:
+        """Charges in elementary charges, shape (N,)."""
+        return self._charges
+
+    def without(self, indices: npt.ArrayLike) -> CoulombField:
+        """Return the same field with some charges removed.
+
+        Args:
+            indices: Indices of the charges to remove.
+
+        Returns:
+            A new field with the same settings.
+        """
+        keep = np.ones(len(self._positions), dtype=bool)
+        keep[np.asarray(indices, dtype=np.intp)] = False
+        return CoulombField(
+            self._positions[keep],
+            self._charges[keep],
+            debye_length=self.debye_length,
+            cutoff=self.cutoff,
+            dielectric=self.dielectric,
+            distance_dielectric=self.distance_dielectric,
+        )
 
     def evaluate(self, points: npt.ArrayLike) -> tuple[FloatArray, FloatArray]:
         """Evaluate the field at a set of points.
@@ -93,12 +137,18 @@ class CoulombField:
 
     def _weights(self, r2: FloatArray, charges: FloatArray) -> FloatArray:
         """Scalar that multiplies the charge-to-point vector to give the field in e/A^2."""
+        # For a potential q exp(-x) / (eps r) with x = r / debye_length, the field is
+        # q exp(-x) (1 + x) / (eps r^2) for constant eps, and q exp(-x) (2 + x) / (k r^3)
+        # for eps = k r. Dividing by r once more turns the vector to the point into the field.
         r = np.sqrt(r2)
+        x = 0.0 if self.debye_length is None else r / self.debye_length
         with np.errstate(divide="ignore", invalid="ignore"):
-            weights = charges / (r2 * r)
+            if self.distance_dielectric:
+                weights = charges * (2.0 + x) / (self.dielectric * r2 * r2)
+            else:
+                weights = charges * (1.0 + x) / (self.dielectric * r2 * r)
             if self.debye_length is not None:
-                x = r / self.debye_length
-                weights = weights * np.exp(-x) * (1.0 + x)
+                weights = weights * np.exp(-x)
         return np.where(r2 > 0, weights, 0.0)
 
     def _evaluate_dense(self, points: FloatArray) -> tuple[FloatArray, FloatArray]:
@@ -247,19 +297,42 @@ def trace(
     return FieldLines(np.concatenate(points), np.concatenate(strengths), offsets)
 
 
-def bond_field(field: CoulombField, start: npt.ArrayLike, end: npt.ArrayLike) -> float:
+def bond_field(
+    field: CoulombField,
+    start: npt.ArrayLike,
+    end: npt.ArrayLike,
+    *,
+    include_self: bool = False,
+) -> float:
     """Field at the midpoint of a bond, projected on the bond direction.
+
+    By default the charges of the two bond atoms are left out, so that the result is
+    the field the environment puts on the bond (as in vibrational Stark analysis).
+    A charge counts as a bond atom when it sits on `start` or `end`.
 
     Args:
         field: The field to evaluate.
         start: Position of the first atom in angstrom, shape (3,).
         end: Position of the second atom in angstrom, shape (3,).
+        include_self: Keep the charges of the bond atoms.
 
     Returns:
         The component of the field along `start` -> `end` in MV/cm.
     """
     start = np.asarray(start, dtype=np.float64)
     end = np.asarray(end, dtype=np.float64)
+    if not include_self:
+        on_bond = (
+            np.minimum(
+                np.linalg.norm(field.positions - start, axis=1),
+                np.linalg.norm(field.positions - end, axis=1),
+            )
+            < _SAME_POINT
+        )
+        if on_bond.all():
+            return 0.0
+        if on_bond.any():
+            field = field.without(np.flatnonzero(on_bond))
     vectors, _ = field.evaluate((0.5 * (start + end))[None, :])
     axis = (end - start) / np.linalg.norm(end - start)
     return float(vectors[0] @ axis)
