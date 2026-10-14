@@ -3,8 +3,11 @@
 # NanoVer is not fully annotated.
 # mypy: disable-error-code="no-untyped-call"
 
-from collections.abc import Iterator
-from typing import Any
+import threading
+import time
+from collections.abc import Callable, Iterator
+from concurrent.futures import Executor, Future
+from typing import Any, ParamSpec, TypeVar
 
 import numpy as np
 import openmm as mm
@@ -76,6 +79,45 @@ def simulation(setup: ServerClientSetup) -> OpenMMSimulation:
     sim.frame_interval = 1
     sim.reset(setup.app)
     return sim
+
+
+P = ParamSpec("P")
+T = TypeVar("T")
+
+
+class ImmediateExecutor(Executor):
+    """Runs each job on the calling thread as soon as it is submitted."""
+
+    def submit(self, fn: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs) -> Future[T]:
+        future: Future[T] = Future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except Exception as error:  # noqa: BLE001
+            future.set_exception(error)
+        return future
+
+
+class ManualExecutor(Executor):
+    """Holds jobs until the test runs them, like a helper thread that is still busy."""
+
+    def __init__(self) -> None:
+        self.jobs: list[tuple[Future[Any], Callable[[], Any]]] = []
+
+    def submit(self, fn: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs) -> Future[T]:
+        future: Future[T] = Future()
+        self.jobs.append((future, lambda: fn(*args, **kwargs)))
+        return future
+
+    def run(self) -> None:
+        """Finish every job submitted so far."""
+        jobs, self.jobs = self.jobs, []
+        for future, job in jobs:
+            future.set_result(job())
+
+
+def attach(simulation: OpenMMSimulation, config: FieldLineConfig | None = None) -> FieldLineService:
+    """Attach a service whose background traces finish as soon as they start."""
+    return FieldLineService(simulation, config, executor=ImmediateExecutor())
 
 
 def seeds_for(config: FieldLineConfig) -> np.ndarray:
@@ -359,11 +401,13 @@ def test_packed_lines_are_in_nanometers_with_lengths_and_colors() -> None:
 # Service
 
 
+@pytest.mark.parametrize("background", [True, False])
 def test_frames_carry_lines_that_match_the_positions(
     setup: ServerClientSetup,
     simulation: OpenMMSimulation,
+    background: bool,  # noqa: FBT001
 ) -> None:
-    FieldLineService(simulation, FieldLineConfig(cutoff=None))
+    attach(simulation, FieldLineConfig(cutoff=None, background=background))
     simulation.advance_by_one_step()
 
     frame = setup.server_current_frame
@@ -385,7 +429,7 @@ def test_the_service_leaves_out_solvent_from_the_topology(setup: ServerClientSet
     simulation = OpenMMSimulation.from_simulation(build_simulation(residues=residues))
     simulation.reset(setup.app)
     config = FieldLineConfig(cutoff=None)
-    FieldLineService(simulation, config)
+    attach(simulation, config)
     simulation.advance_by_one_step()
 
     frame = setup.server_current_frame
@@ -401,7 +445,7 @@ def test_lines_reach_the_client_as_bytes(
     setup: ServerClientSetup,
     simulation: OpenMMSimulation,
 ) -> None:
-    FieldLineService(simulation)
+    attach(simulation)
     simulation.advance_by_one_step()
     setup.assert_frames_synced_soon()
     received = setup.client_current_frame.frame_dict
@@ -422,7 +466,7 @@ def test_lines_are_traced_every_stride_frames(
         return original(*args)
 
     monkeypatch.setattr(service_module, "trace_lines", counting)
-    FieldLineService(simulation, FieldLineConfig(stride=3))
+    attach(simulation, FieldLineConfig(stride=3))
     for _ in range(7):
         simulation.advance_by_one_step()
     assert traced == [1, 4, 7]
@@ -432,7 +476,7 @@ def test_disabling_clears_the_lines_once(
     setup: ServerClientSetup,
     simulation: OpenMMSimulation,
 ) -> None:
-    service = FieldLineService(simulation)
+    service = attach(simulation)
     simulation.advance_by_one_step()
     assert len(setup.server_current_frame[LENGTHS_KEY]) > 0
 
@@ -451,7 +495,7 @@ def test_disabled_from_the_start_publishes_nothing(
     setup: ServerClientSetup,
     simulation: OpenMMSimulation,
 ) -> None:
-    FieldLineService(simulation, FieldLineConfig(enabled=False))
+    attach(simulation, FieldLineConfig(enabled=False))
     simulation.advance_by_one_step()
     assert POSITIONS_KEY not in setup.server_current_frame
 
@@ -460,7 +504,7 @@ def test_clients_can_configure_with_a_command(
     setup: ServerClientSetup,
     simulation: OpenMMSimulation,
 ) -> None:
-    service = FieldLineService(simulation)
+    service = attach(simulation)
     service.register_commands(setup.app)
 
     result = setup.client.run_command_blocking(CONFIGURE_COMMAND, seed_atoms=[3], stride=2)
@@ -481,7 +525,7 @@ def test_clients_can_configure_with_a_command(
 
 
 def test_configure_restarts_the_stride(simulation: OpenMMSimulation) -> None:
-    service = FieldLineService(simulation, FieldLineConfig(stride=100))
+    service = attach(simulation, FieldLineConfig(stride=100))
     assert POSITIONS_KEY in simulation.make_regular_frame()
     assert POSITIONS_KEY not in simulation.make_regular_frame()
     service.configure(max_lines=5)
@@ -493,7 +537,7 @@ def test_a_reset_restarts_the_stride(
     setup: ServerClientSetup,
     simulation: OpenMMSimulation,
 ) -> None:
-    FieldLineService(simulation, FieldLineConfig(stride=100))
+    attach(simulation, FieldLineConfig(stride=100))
     simulation.advance_by_one_step()
     simulation.reset(setup.app)
     assert POSITIONS_KEY not in setup.server_current_frame
@@ -501,16 +545,84 @@ def test_a_reset_restarts_the_stride(
     assert POSITIONS_KEY in setup.server_current_frame
 
 
+@pytest.mark.parametrize("background", [True, False])
+@pytest.mark.parametrize("charged", [True, False])
 def test_a_failed_trace_does_not_stop_the_simulation(
     setup: ServerClientSetup,
-    simulation: OpenMMSimulation,
     caplog: pytest.LogCaptureFixture,
+    background: bool,  # noqa: FBT001
+    charged: bool,  # noqa: FBT001
 ) -> None:
-    FieldLineService(simulation, FieldLineConfig(seed_atoms=(99,)))
+    # A bad seed atom fails inside the trace; a missing NonbondedForce fails before it.
+    simulation = OpenMMSimulation.from_simulation(build_simulation(charged=charged))
+    simulation.reset(setup.app)
+    attach(simulation, FieldLineConfig(seed_atoms=(99,), background=background))
     simulation.advance_by_one_step()
     assert POSITIONS_KEY not in setup.server_current_frame
     assert "Could not trace field lines" in caplog.text
     assert setup.server_current_frame.particle_positions is not None
+
+
+def test_lines_from_a_background_trace_go_out_with_a_later_frame(
+    simulation: OpenMMSimulation,
+) -> None:
+    executor = ManualExecutor()
+    FieldLineService(simulation, executor=executor)
+    first = simulation.make_regular_frame()
+    assert POSITIONS_KEY not in first
+    assert len(executor.jobs) == 1
+
+    # Still busy: no lines yet, and no second trace queued behind the first.
+    assert POSITIONS_KEY not in simulation.make_regular_frame()
+    assert len(executor.jobs) == 1
+
+    executor.run()
+    later = simulation.make_regular_frame()
+    expected = trace_lines(
+        10.0 * np.asarray(first.particle_positions, dtype=np.float64),
+        np.array(CHARGES),
+        FieldLineConfig(),
+    )
+    assert unpack(later.frame_dict)[0] == pytest.approx(expected.points / 10.0, abs=1e-6)
+    assert len(executor.jobs) == 1  # The next trace has started.
+
+
+@pytest.mark.parametrize("event", ["configure", "reset"])
+def test_a_trace_started_before_a_change_is_thrown_away(
+    setup: ServerClientSetup,
+    simulation: OpenMMSimulation,
+    event: str,
+) -> None:
+    executor = ManualExecutor()
+    service = FieldLineService(simulation, executor=executor)
+    simulation.make_regular_frame()
+    if event == "configure":
+        service.configure(max_lines=5)
+    else:
+        simulation.reset(setup.app)
+
+    executor.run()
+    frame = simulation.make_regular_frame()
+    assert POSITIONS_KEY not in frame
+    assert len(executor.jobs) == 1  # A fresh trace with the new state.
+    executor.run()
+    assert len(unpack(simulation.make_regular_frame().frame_dict)[1]) > 0
+
+
+def test_a_real_background_thread_publishes_lines_and_stops(
+    simulation: OpenMMSimulation,
+) -> None:
+    service = FieldLineService(simulation)
+    deadline = time.monotonic() + 10.0
+    while POSITIONS_KEY not in simulation.make_regular_frame():
+        assert time.monotonic() < deadline, "No lines arrived from the background thread."
+        time.sleep(0.01)
+
+    service.detach()
+    for thread in threading.enumerate():
+        if thread.name.startswith("fieldlines"):
+            thread.join(timeout=5.0)
+            assert not thread.is_alive()
 
 
 def test_detach_restores_the_simulation(

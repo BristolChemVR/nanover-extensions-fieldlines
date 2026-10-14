@@ -16,6 +16,8 @@ and lines start in the space around the molecule where the field is strongest.
 from __future__ import annotations
 
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, fields, replace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -27,6 +29,7 @@ from nanover_extensions.fieldlines.core import CoulombField, FieldLines, trace
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from concurrent.futures import Executor, Future
 
     import numpy.typing as npt
     from nanover.core import AppServer
@@ -61,6 +64,7 @@ SOLVENT_RESIDUES = frozenset(
 )  # fmt: skip
 """Residue names left out of the field unless `include_solvent` is set."""
 
+_TRACE_FAILED = "Could not trace field lines."
 _WEAK_COLOR = np.array([0.15, 0.35, 1.0])
 _STRONG_COLOR = np.array([1.0, 0.9, 0.2])
 _INDEX_FIELDS = ("source_atoms", "seed_atoms", "region_atoms")
@@ -83,7 +87,9 @@ class FieldLineConfig:
 
     Attributes:
         enabled: Whether lines are published.
-        stride: Trace on every `stride`-th frame. Other frames keep the previous lines.
+        stride: Start a trace at most every `stride` frames. Other frames keep the
+            previous lines. In the background, a trace waits for the previous one to end.
+        background: Trace on a helper thread instead of while the frame is made.
         seeding: How lines are started, one of `SEEDING_MODES`.
         source_atoms: Indices of the atoms whose charges make the field. If None, all
             atoms except solvent (see `include_solvent`).
@@ -114,6 +120,7 @@ class FieldLineConfig:
 
     enabled: bool = True
     stride: int = 1
+    background: bool = True
     seeding: str = "auto"
     source_atoms: tuple[int, ...] | None = None
     include_solvent: bool = False
@@ -474,15 +481,37 @@ def pack_lines(lines: FieldLines, config: FieldLineConfig) -> dict[str, bytes]:
     }
 
 
+@dataclass(frozen=True)
+class _Job:
+    """A trace running in the background, and what it was started with."""
+
+    future: Future[FieldLines]
+    generation: int
+    config: FieldLineConfig
+
+
 class FieldLineService:
     """Adds field lines to the frames of an OpenMM simulation served by NanoVer.
+
+    With `background` set (the default), lines are traced on a helper thread so the
+    simulation never waits for them. A trace starts from a copy of the frame's
+    positions, and its lines go out with the first frame made after it finishes.
+    Only one trace runs at a time, and a trace started before a reset or a change of
+    settings is thrown away.
 
     Args:
         simulation: The NanoVer OpenMM simulation to follow.
         config: Initial settings. Defaults are used if None.
+        executor: Runs background traces. If None, the service starts its own
+            single-thread executor when it first needs one, and shuts it down on `detach`.
     """
 
-    def __init__(self, simulation: OpenMMSimulation, config: FieldLineConfig | None = None) -> None:
+    def __init__(
+        self,
+        simulation: OpenMMSimulation,
+        config: FieldLineConfig | None = None,
+        executor: Executor | None = None,
+    ) -> None:
         self.config = config or FieldLineConfig()
         self._simulation = simulation
         self._make_regular_frame: Callable[..., FrameData] = simulation.make_regular_frame
@@ -492,6 +521,13 @@ class FieldLineService:
         self._solvent: BoolArray = np.zeros(0, dtype=bool)
         self._frames_until_trace = 0
         self._published = False
+        self._executor = executor
+        self._owns_executor = executor is None
+        self._job: _Job | None = None
+        # Raised by every reset and change of settings, so older traces can be recognised.
+        self._generation = 0
+        # Commands arrive on a server thread while frames are made on the simulation's.
+        self._lock = threading.Lock()
 
         simulation.make_regular_frame = self._regular_frame  # type: ignore[method-assign]
         simulation.make_topology_frame = self._topology_frame  # type: ignore[method-assign]
@@ -500,6 +536,12 @@ class FieldLineService:
         """Stop adding lines and give the simulation its own frame methods back."""
         self._simulation.make_regular_frame = self._make_regular_frame  # type: ignore[method-assign]
         self._simulation.make_topology_frame = self._make_topology_frame  # type: ignore[method-assign]
+        with self._lock:
+            self._restart()
+            self._job = None
+            if self._owns_executor and self._executor is not None:
+                self._executor.shutdown(wait=False, cancel_futures=True)
+                self._executor = None
 
     def register_commands(self, app_server: AppServer) -> None:
         """Let clients change the settings with the `fieldlines/configure` command.
@@ -521,37 +563,94 @@ class FieldLineService:
         Raises:
             ValueError: If a name is not a setting or a value is not allowed.
         """
-        self.config = self.config.updated(**changes)
+        config = self.config.updated(**changes)
+        with self._lock:
+            self.config = config
+            self._restart()
+        return asdict(config)
+
+    def _restart(self) -> None:
+        """Trace on the next frame and disown any trace already running. Needs the lock."""
         self._frames_until_trace = 0
-        return asdict(self.config)
+        self._generation += 1
 
     def _topology_frame(self, *args: object, **kwargs: object) -> FrameData:
         # A topology frame starts a new frame sequence, which clears the lines on clients.
-        self._frames_until_trace = 0
-        self._published = False
+        with self._lock:
+            self._restart()
+            self._published = False
         return self._make_topology_frame(*args, **kwargs)
 
     def _regular_frame(self, positions: object = None) -> FrameData:
         frame = self._make_regular_frame(positions)
+        with self._lock:
+            self._add_lines(frame)
+        return frame
+
+    def _add_lines(self, frame: FrameData) -> None:
+        """Add new lines to a frame, or clear them, as the settings ask. Needs the lock."""
         config = self.config
         if not config.enabled:
             if self._published:
-                frame.frame_dict.update(pack_lines(_NO_LINES, config))
+                self._publish(frame, _NO_LINES, config)
                 self._published = False
-            return frame
+            return
+        self._collect(frame)
         if self._frames_until_trace > 0:
             self._frames_until_trace -= 1
-            return frame
-        self._frames_until_trace = config.stride - 1
+        elif not config.background:
+            self._frames_until_trace = config.stride - 1
+            self._trace_now(frame, config)
+        elif self._job is None:
+            # If a trace is still running, try again on the next frame.
+            self._frames_until_trace = config.stride - 1
+            self._start(frame, config)
+            # An executor that finishes straight away has lines for this frame.
+            self._collect(frame)
+
+    def _trace_now(self, frame: FrameData, config: FieldLineConfig) -> None:
         try:
             charges, solvent = self._system_data()
             lines = trace_lines(self._positions(frame), charges, config, solvent)
-            frame.frame_dict.update(pack_lines(lines, config))
-            self._published = True
         except Exception:
             # A failed trace must not stop the simulation.
-            logger.exception("Could not trace field lines.")
-        return frame
+            logger.exception(_TRACE_FAILED)
+            return
+        self._publish(frame, lines, config)
+
+    def _start(self, frame: FrameData, config: FieldLineConfig) -> None:
+        try:
+            charges, solvent = self._system_data()
+            positions = self._positions(frame)  # A new array, so the trace owns it.
+            future = self._get_executor().submit(trace_lines, positions, charges, config, solvent)
+        except Exception:
+            logger.exception(_TRACE_FAILED)
+            return
+        self._job = _Job(future, self._generation, config)
+
+    def _collect(self, frame: FrameData) -> None:
+        """Publish the lines of a finished background trace, unless they are out of date."""
+        job = self._job
+        if job is None or not job.future.done():
+            return
+        self._job = None
+        if job.generation != self._generation:
+            return
+        try:
+            lines = job.future.result()
+        except Exception:
+            logger.exception(_TRACE_FAILED)
+            return
+        self._publish(frame, lines, job.config)
+
+    def _publish(self, frame: FrameData, lines: FieldLines, config: FieldLineConfig) -> None:
+        frame.frame_dict.update(pack_lines(lines, config))
+        self._published = True
+
+    def _get_executor(self) -> Executor:
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fieldlines")
+        return self._executor
 
     @staticmethod
     def _positions(frame: FrameData) -> FloatArray:
