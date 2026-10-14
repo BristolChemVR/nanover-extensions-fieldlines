@@ -8,6 +8,9 @@ The lines are added to the simulation's regular frames under three keys:
 
 All three are sent as raw bytes. Vertices of a line are ordered along the field
 direction (from positive towards negative charge).
+
+By default the field comes from every charged atom except water and monovalent ions,
+and lines start in the space around the molecule where the field is strongest.
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 from openmm import NonbondedForce, unit
+from scipy.spatial import cKDTree
 
 from nanover_extensions.fieldlines.core import CoulombField, FieldLines, trace
 
@@ -29,9 +33,11 @@ if TYPE_CHECKING:
     from nanover.openmm import OpenMMSimulation
     from nanover.trajectory import FrameData
     from openmm import System
-    from openmm.app import Simulation
+    from openmm.app import Simulation, Topology
 
-    from nanover_extensions.fieldlines.core import FloatArray
+    from nanover_extensions.fieldlines.core import FloatArray, IndexArray
+
+    BoolArray = npt.NDArray[np.bool_]
 
 logger = logging.getLogger(__name__)
 
@@ -44,9 +50,20 @@ ANGSTROM_PER_NM = 10.0
 MIN_LINE_POINTS = 3
 """The client's spline nodes need at least three vertices per line."""
 
+SEEDING_MODES = ("auto", "strength", "region", "atoms")
+SOLVENT_RESIDUES = frozenset(
+    {
+        # Water models.
+        "HOH", "WAT", "SOL", "H2O", "TIP", "TIP3", "TIP4", "TIP5", "T3P", "T4P", "SPC",
+        # Monovalent ions. Multivalent ions are often structural, so they stay sources.
+        "NA", "CL", "K", "LI", "RB", "CS", "Na+", "Cl-", "K+", "SOD", "CLA", "POT", "CES",
+    },
+)  # fmt: skip
+"""Residue names left out of the field unless `include_solvent` is set."""
+
 _WEAK_COLOR = np.array([0.15, 0.35, 1.0])
 _STRONG_COLOR = np.array([1.0, 0.9, 0.2])
-_INDEX_FIELDS = ("source_atoms", "seed_atoms")
+_INDEX_FIELDS = ("source_atoms", "seed_atoms", "region_atoms")
 
 
 @dataclass(frozen=True)
@@ -55,18 +72,39 @@ class FieldLineConfig:
 
     Lengths are in angstrom and field strengths in MV/cm.
 
+    Seeding modes:
+
+    - `strength`: on a grid around the source atoms, at the points where the field is
+      strongest, at least `seed_spacing` apart (after VMD's field line seeding).
+    - `region`: the same, but only within `seed_shell` of the `region_atoms`.
+    - `atoms`: on small spheres around `seed_atoms`.
+    - `auto`: `region` if `region_atoms` is set, else `atoms` if `seed_atoms` is set,
+      else `strength`.
+
     Attributes:
         enabled: Whether lines are published.
         stride: Trace on every `stride`-th frame. Other frames keep the previous lines.
-        source_atoms: Indices of the atoms whose charges make the field. All atoms if None.
-        seed_atoms: Indices of the atoms to start lines around. If None, the
+        seeding: How lines are started, one of `SEEDING_MODES`.
+        source_atoms: Indices of the atoms whose charges make the field. If None, all
+            atoms except solvent (see `include_solvent`).
+        include_solvent: Let water and monovalent ions make the field when
+            `source_atoms` is None.
+        region_atoms: Atoms to start lines around in `region` mode.
+        seed_atoms: Atoms to start lines around in `atoms` mode. If None, the
             `auto_seed_atoms` source atoms with the largest absolute charge are used.
         auto_seed_atoms: Number of atoms picked when `seed_atoms` is None.
         seeds_per_atom: Number of lines started around each seed atom.
         seed_radius: Distance of the seeds from their atom.
+        grid_spacing: Spacing of the grid of candidate seeds in `strength` and `region` mode.
+        seed_shell: Largest distance of a candidate seed from the atoms it surrounds.
+        seed_clearance: Smallest distance of a candidate seed from any source atom.
+        seed_spacing: Smallest distance between two seeds.
         max_lines: Upper limit on the number of lines traced.
         debye_length: Debye-Hueckel screening length. No screening if None.
         cutoff: Distance beyond which charges are ignored. No cutoff if None.
+        dielectric: Relative permittivity, or its slope per angstrom if
+            `distance_dielectric` is set.
+        distance_dielectric: Use a permittivity of `dielectric * r`.
         step: Tracing step length.
         max_steps: Maximum number of steps in each direction from a seed.
         min_points: Lines with fewer vertices than this are dropped.
@@ -76,14 +114,23 @@ class FieldLineConfig:
 
     enabled: bool = True
     stride: int = 1
+    seeding: str = "auto"
     source_atoms: tuple[int, ...] | None = None
+    include_solvent: bool = False
+    region_atoms: tuple[int, ...] | None = None
     seed_atoms: tuple[int, ...] | None = None
     auto_seed_atoms: int = 8
     seeds_per_atom: int = 8
     seed_radius: float = 1.5
+    grid_spacing: float = 3.0
+    seed_shell: float = 8.0
+    seed_clearance: float = 2.5
+    seed_spacing: float = 4.0
     max_lines: int = 200
     debye_length: float | None = None
     cutoff: float | None = 12.0
+    dielectric: float = 1.0
+    distance_dielectric: bool = False
     step: float = 0.25
     max_steps: int = 100
     min_points: int = 6
@@ -91,16 +138,35 @@ class FieldLineConfig:
     strong_strength: float = 1000.0
 
     def __post_init__(self) -> None:
-        positive = ("stride", "seeds_per_atom", "seed_radius", "max_lines", "step", "max_steps")
+        self._check_numbers()
+        if self.seeding not in SEEDING_MODES:
+            raise ValueError(f"`seeding` must be one of {SEEDING_MODES}, not {self.seeding!r}.")
+        if self.seeding == "region" and self.region_atoms is None:
+            msg = "`region_atoms` must be set for `region` seeding."
+            raise ValueError(msg)
+
+    def _check_numbers(self) -> None:
+        positive = (
+            "stride",
+            "seeds_per_atom",
+            "seed_radius",
+            "grid_spacing",
+            "seed_shell",
+            "max_lines",
+            "dielectric",
+            "step",
+            "max_steps",
+        )
         for name in positive:
             if getattr(self, name) <= 0:
                 raise ValueError(f"`{name}` must be positive, not {getattr(self, name)}.")
+        for name in ("auto_seed_atoms", "seed_clearance", "seed_spacing"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"`{name}` must not be negative, not {getattr(self, name)}.")
         for name in ("debye_length", "cutoff"):
             value = getattr(self, name)
             if value is not None and value <= 0:
                 raise ValueError(f"`{name}` must be positive or None, not {value}.")
-        if self.auto_seed_atoms < 0:
-            raise ValueError(f"`auto_seed_atoms` must not be negative, not {self.auto_seed_atoms}.")
         if self.min_points < MIN_LINE_POINTS:
             raise ValueError(f"`min_points` must be at least {MIN_LINE_POINTS}.")
         if not 0 < self.weak_strength < self.strong_strength:
@@ -153,6 +219,18 @@ def get_charges(system: System) -> FloatArray:
     raise ValueError(msg)
 
 
+def solvent_mask(topology: Topology) -> BoolArray:
+    """Mark the atoms that belong to water or monovalent ion residues.
+
+    Args:
+        topology: The OpenMM topology of the system.
+
+    Returns:
+        True for each solvent atom, shape (N,).
+    """
+    return np.array([atom.residue.name in SOLVENT_RESIDUES for atom in topology.atoms()], bool)
+
+
 def fibonacci_sphere(count: int) -> FloatArray:
     """Return `count` points spread evenly over the unit sphere, shape (count, 3)."""
     index = np.arange(count) + 0.5
@@ -181,29 +259,57 @@ def strength_colors(strengths: FloatArray, weak: float, strong: float) -> npt.ND
     return np.round(255.0 * rgba).astype(np.uint8)
 
 
-def _select(indices: tuple[int, ...] | None, count: int, name: str) -> npt.NDArray[np.intp]:
-    """Turn an optional index list into an index array, checking the range."""
-    if indices is None:
-        return np.arange(count)
+def _select(indices: tuple[int, ...], count: int, name: str) -> IndexArray:
+    """Turn an index list into an index array, checking the range."""
     selected = np.array(indices, dtype=np.intp)
     if len(selected) and (selected.min() < 0 or selected.max() >= count):
         raise ValueError(f"`{name}` has indices outside the {count} atoms of the system.")
     return selected
 
 
-def make_seeds(positions: FloatArray, charges: FloatArray, config: FieldLineConfig) -> FloatArray:
-    """Place the starting points of the lines on small spheres around the seed atoms.
+def source_indices(
+    charges: FloatArray,
+    config: FieldLineConfig,
+    solvent: BoolArray | None = None,
+) -> IndexArray:
+    """Choose the atoms whose charges make the field.
 
     Args:
-        positions: Atom positions in angstrom, shape (N, 3).
         charges: Atom charges, shape (N,).
-        config: The settings that choose the seed atoms and the sphere.
+        config: The settings that choose the source atoms.
+        solvent: True for each solvent atom, shape (N,). No atom is solvent if None.
 
     Returns:
-        Seed points in angstrom, at most `config.max_lines` of them, shape (S, 3).
+        Indices of the charged source atoms.
     """
+    if config.source_atoms is not None:
+        sources = _select(config.source_atoms, len(charges), "source_atoms")
+    elif solvent is None or config.include_solvent:
+        sources = np.arange(len(charges))
+    else:
+        sources = np.flatnonzero(~solvent)
+    return np.asarray(sources[charges[sources] != 0], dtype=np.intp)
+
+
+def seeding_mode(config: FieldLineConfig) -> str:
+    """Resolve `auto` seeding to the mode that will be used."""
+    if config.seeding != "auto":
+        return config.seeding
+    if config.region_atoms is not None:
+        return "region"
+    if config.seed_atoms is not None:
+        return "atoms"
+    return "strength"
+
+
+def _atom_seeds(
+    positions: FloatArray,
+    charges: FloatArray,
+    sources: IndexArray,
+    config: FieldLineConfig,
+) -> FloatArray:
+    """Place seeds on small spheres around the seed atoms."""
     if config.seed_atoms is None:
-        sources = _select(config.source_atoms, len(positions), "source_atoms")
         strongest = np.argsort(-np.abs(charges[sources]), kind="stable")
         atoms = sources[strongest[: config.auto_seed_atoms]]
     else:
@@ -217,29 +323,130 @@ def make_seeds(positions: FloatArray, charges: FloatArray, config: FieldLineConf
     return seeds
 
 
-def trace_lines(positions: FloatArray, charges: FloatArray, config: FieldLineConfig) -> FieldLines:
+def grid_around(centres: FloatArray, shell: float, spacing: float) -> FloatArray:
+    """Return the points of a cubic grid that lie within `shell` of any centre.
+
+    Args:
+        centres: Positions to surround, shape (C, 3), with C > 0.
+        shell: Largest distance from the nearest centre.
+        spacing: Grid spacing.
+
+    Returns:
+        Grid points, shape (G, 3).
+    """
+    low = centres.min(axis=0) - shell
+    high = centres.max(axis=0) + shell
+    axes = [np.arange(lo, hi + spacing / 2, spacing) for lo, hi in zip(low, high, strict=True)]
+    grid = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
+    distance, _ = cKDTree(centres).query(grid, distance_upper_bound=shell * (1 + 1e-9))
+    return grid[np.isfinite(np.asarray(distance, dtype=np.float64))]
+
+
+def spread_strongest(
+    points: FloatArray,
+    strengths: FloatArray,
+    spacing: float,
+    count: int,
+) -> FloatArray:
+    """Pick up to `count` points, strongest first, keeping them `spacing` apart.
+
+    Points with no field are never picked.
+
+    Args:
+        points: Candidate points, shape (P, 3).
+        strengths: Field magnitude at each candidate, shape (P,).
+        spacing: Smallest distance between two picked points.
+        count: Largest number of points to pick.
+
+    Returns:
+        The picked points in order of decreasing strength, shape (S, 3).
+    """
+    candidates = np.flatnonzero(strengths > 0)
+    order = candidates[np.argsort(-strengths[candidates], kind="stable")]
+    tree = cKDTree(points)
+    blocked = np.zeros(len(points), dtype=bool)
+    chosen: list[int] = []
+    for index in order:
+        if len(chosen) == count:
+            break
+        if blocked[index]:
+            continue
+        chosen.append(int(index))
+        blocked[tree.query_ball_point(points[index], spacing)] = True
+    return points[np.array(chosen, dtype=np.intp)].reshape(-1, 3)
+
+
+def make_seeds(
+    positions: FloatArray,
+    charges: FloatArray,
+    sources: IndexArray,
+    field: CoulombField,
+    config: FieldLineConfig,
+) -> FloatArray:
+    """Place the starting points of the lines.
+
+    Args:
+        positions: Atom positions in angstrom, shape (N, 3).
+        charges: Atom charges, shape (N,).
+        sources: Indices of the atoms that make `field`.
+        field: The field of the source atoms.
+        config: The settings that choose the seeding mode and its parameters.
+
+    Returns:
+        Seed points in angstrom, at most `config.max_lines` of them, shape (S, 3).
+    """
+    mode = seeding_mode(config)
+    if mode == "atoms":
+        return _atom_seeds(positions, charges, sources, config)
+    if mode == "region":
+        region = _select(config.region_atoms or (), len(positions), "region_atoms")
+        centres = positions[region]
+    else:
+        centres = positions[sources]
+    if len(centres) == 0:
+        return np.zeros((0, 3))
+    candidates = grid_around(centres, config.seed_shell, config.grid_spacing)
+    clearance, _ = cKDTree(field.positions).query(candidates)
+    candidates = candidates[clearance >= config.seed_clearance]
+    vectors, _ = field.evaluate(candidates)
+    strengths = np.linalg.norm(vectors, axis=1)
+    return spread_strongest(candidates, strengths, config.seed_spacing, config.max_lines)
+
+
+_NO_LINES = FieldLines(np.zeros((0, 3)), np.zeros(0), np.zeros(1, dtype=np.intp))
+
+
+def trace_lines(
+    positions: FloatArray,
+    charges: FloatArray,
+    config: FieldLineConfig,
+    solvent: BoolArray | None = None,
+) -> FieldLines:
     """Trace the field lines of a set of atoms.
 
     Args:
         positions: Atom positions in angstrom, shape (N, 3).
         charges: Atom charges in elementary charges, shape (N,).
         config: The tracing settings.
+        solvent: True for each solvent atom, shape (N,). No atom is solvent if None.
 
     Returns:
         The lines with at least `config.min_points` vertices, in angstrom and MV/cm.
     """
-    sources = _select(config.source_atoms, len(positions), "source_atoms")
-    sources = sources[charges[sources] != 0]
-    seeds = make_seeds(positions, charges, config)
-    if len(sources) == 0 or len(seeds) == 0:
-        return FieldLines(np.zeros((0, 3)), np.zeros(0), np.zeros(1, dtype=np.intp))
-
+    sources = source_indices(charges, config, solvent)
+    if len(sources) == 0:
+        return _NO_LINES
     field = CoulombField(
         positions[sources],
         charges[sources],
         debye_length=config.debye_length,
         cutoff=config.cutoff,
+        dielectric=config.dielectric,
+        distance_dielectric=config.distance_dielectric,
     )
+    seeds = make_seeds(positions, charges, sources, field, config)
+    if len(seeds) == 0:
+        return _NO_LINES
     lines = trace(field, seeds, step=config.step, max_steps=config.max_steps)
 
     lengths = np.diff(lines.offsets)
@@ -267,9 +474,6 @@ def pack_lines(lines: FieldLines, config: FieldLineConfig) -> dict[str, bytes]:
     }
 
 
-_NO_LINES = FieldLines(np.zeros((0, 3)), np.zeros(0), np.zeros(1, dtype=np.intp))
-
-
 class FieldLineService:
     """Adds field lines to the frames of an OpenMM simulation served by NanoVer.
 
@@ -285,6 +489,7 @@ class FieldLineService:
         self._make_topology_frame: Callable[..., FrameData] = simulation.make_topology_frame
         self._system: System | None = None
         self._charges: FloatArray = np.zeros(0)
+        self._solvent: BoolArray = np.zeros(0, dtype=bool)
         self._frames_until_trace = 0
         self._published = False
 
@@ -339,7 +544,8 @@ class FieldLineService:
             return frame
         self._frames_until_trace = config.stride - 1
         try:
-            lines = trace_lines(self._positions(frame), self._current_charges(), config)
+            charges, solvent = self._system_data()
+            lines = trace_lines(self._positions(frame), charges, config, solvent)
             frame.frame_dict.update(pack_lines(lines, config))
             self._published = True
         except Exception:
@@ -351,9 +557,11 @@ class FieldLineService:
     def _positions(frame: FrameData) -> FloatArray:
         return ANGSTROM_PER_NM * np.asarray(frame.particle_positions, dtype=np.float64)
 
-    def _current_charges(self) -> FloatArray:
-        system = cast("Simulation", self._simulation.simulation).system
-        if system is not self._system:
-            self._charges = get_charges(system)
-            self._system = system
-        return self._charges
+    def _system_data(self) -> tuple[FloatArray, BoolArray]:
+        """Charges and solvent atoms of the current system, read once per system."""
+        simulation = cast("Simulation", self._simulation.simulation)
+        if simulation.system is not self._system:
+            self._charges = get_charges(simulation.system)
+            self._solvent = solvent_mask(simulation.topology)
+            self._system = simulation.system
+        return self._charges, self._solvent

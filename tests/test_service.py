@@ -4,6 +4,7 @@
 # mypy: disable-error-code="no-untyped-call"
 
 from collections.abc import Iterator
+from typing import Any
 
 import numpy as np
 import openmm as mm
@@ -14,7 +15,7 @@ from openmm import app
 from openmm.unit import femtosecond, kelvin, nanometer, picosecond
 
 from nanover_extensions.fieldlines import service as service_module
-from nanover_extensions.fieldlines.core import FieldLines
+from nanover_extensions.fieldlines.core import CoulombField, FieldLines
 from nanover_extensions.fieldlines.service import (
     COLORS_KEY,
     CONFIGURE_COMMAND,
@@ -24,8 +25,13 @@ from nanover_extensions.fieldlines.service import (
     FieldLineService,
     fibonacci_sphere,
     get_charges,
+    grid_around,
     make_seeds,
     pack_lines,
+    seeding_mode,
+    solvent_mask,
+    source_indices,
+    spread_strongest,
     strength_colors,
     trace_lines,
 )
@@ -33,18 +39,19 @@ from nanover_extensions.fieldlines.service import (
 CHARGES = [1.0, -1.0, 0.0, 0.5]
 POSITIONS_NM = [[0.0, 0.0, 0.3], [0.0, 0.0, -0.3], [1.5, 0.0, 0.0], [0.0, 1.5, 0.0]]
 POSITIONS = 10.0 * np.array(POSITIONS_NM)
+RESIDUES = ["AR"] * 4
 
 
-def build_simulation(*, charged: bool = True) -> app.Simulation:
+def build_simulation(*, charged: bool = True, residues: list[str] = RESIDUES) -> app.Simulation:
     """Return a tiny non-periodic OpenMM simulation of four argon-like particles."""
     system = mm.System()
     topology = app.Topology()
     chain = topology.addChain()
     force = mm.NonbondedForce()
     force.setNonbondedMethod(force.NoCutoff)
-    for charge in CHARGES:
+    for charge, name in zip(CHARGES, residues, strict=True):
         system.addParticle(mass=40.0)
-        residue = topology.addResidue(name="AR", chain=chain)
+        residue = topology.addResidue(name=name, chain=chain)
         topology.addAtom(element=app.Element.getBySymbol("Ar"), name="Ar", residue=residue)
         force.addParticle(charge=charge, sigma=0.3, epsilon=0.0)
     system.addForce(mm.CMMotionRemover())
@@ -69,6 +76,14 @@ def simulation(setup: ServerClientSetup) -> OpenMMSimulation:
     sim.frame_interval = 1
     sim.reset(setup.app)
     return sim
+
+
+def seeds_for(config: FieldLineConfig) -> np.ndarray:
+    """Return the seeds that `config` places around the test atoms."""
+    charges = np.array(CHARGES)
+    sources = source_indices(charges, config)
+    field = CoulombField(POSITIONS[sources], charges[sources], cutoff=config.cutoff)
+    return make_seeds(POSITIONS, charges, sources, field, config)
 
 
 def unpack(frame_dict: dict[str, bytes]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -105,6 +120,11 @@ def test_updated_changes_settings_and_converts_indices() -> None:
         {"cutoff": 0.0},
         {"debye_length": -2.0},
         {"auto_seed_atoms": -1},
+        {"grid_spacing": 0.0},
+        {"seed_spacing": -1.0},
+        {"dielectric": 0.0},
+        {"seeding": "random"},
+        {"seeding": "region"},
         {"min_points": 2},
         {"weak_strength": 0.0},
         {"weak_strength": 10.0, "strong_strength": 5.0},
@@ -148,33 +168,140 @@ def test_strength_colors_span_the_scale_logarithmically() -> None:
     assert colors[3, :3] == pytest.approx((colors[2, :3] / 2 + colors[4, :3] / 2), abs=1)
 
 
+def test_solvent_mask_marks_water_and_monovalent_ions() -> None:
+    residues = ["ALA", "HOH", "NA", "ZN"]
+    topology = build_simulation(residues=residues).topology
+    assert solvent_mask(topology).tolist() == [False, True, True, False]
+
+
+def test_sources_leave_out_solvent_and_neutral_atoms() -> None:
+    charges = np.array(CHARGES)
+    solvent = np.array([False, True, False, False])
+    config = FieldLineConfig()
+    assert source_indices(charges, config).tolist() == [0, 1, 3]
+    assert source_indices(charges, config, solvent).tolist() == [0, 3]
+    assert source_indices(charges, config.updated(include_solvent=True), solvent).tolist() == [
+        0,
+        1,
+        3,
+    ]
+    # An explicit choice wins over the solvent rule.
+    assert source_indices(charges, config.updated(source_atoms=[1, 2]), solvent).tolist() == [1]
+
+
+@pytest.mark.parametrize(
+    ("changes", "mode"),
+    [
+        ({}, "strength"),
+        ({"seed_atoms": [0]}, "atoms"),
+        ({"region_atoms": [0], "seed_atoms": [0]}, "region"),
+        ({"seeding": "atoms"}, "atoms"),
+        ({"seeding": "strength", "region_atoms": [0]}, "strength"),
+    ],
+)
+def test_auto_seeding_follows_the_chosen_atoms(changes: dict[str, object], mode: str) -> None:
+    assert seeding_mode(FieldLineConfig().updated(**changes)) == mode
+
+
+def test_grid_covers_the_shell_around_the_centres() -> None:
+    centres = np.array([[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]])
+    grid = grid_around(centres, shell=3.0, spacing=1.0)
+    distance = np.linalg.norm(grid[:, None] - centres[None], axis=2).min(axis=1)
+    assert distance.max() <= 3.0
+    assert any(np.allclose(point, [3.0, 0.0, 0.0]) for point in grid)
+    assert any(np.allclose(point, [0.0, -3.0, 0.0]) for point in grid)
+    assert not any(np.allclose(point, [5.0, 0.0, 0.0]) for point in grid)
+    assert len(grid) == 2 * len(grid_around(centres[:1], shell=3.0, spacing=1.0))
+
+
+def test_spread_picks_the_strongest_points_apart() -> None:
+    points = np.array([[0.0, 0, 0], [1.0, 0, 0], [5.0, 0, 0], [9.0, 0, 0], [20.0, 0, 0]])
+    strengths = np.array([3.0, 5.0, 1.0, 2.0, 0.0])
+    picked = spread_strongest(points, strengths, spacing=2.0, count=10)
+    assert picked.tolist() == [[1.0, 0, 0], [9.0, 0, 0], [5.0, 0, 0]]
+    assert spread_strongest(points, strengths, spacing=2.0, count=2).tolist() == [
+        [1.0, 0, 0],
+        [9.0, 0, 0],
+    ]
+    assert spread_strongest(points, strengths, spacing=0.0, count=10).shape == (4, 3)
+    assert spread_strongest(points, np.zeros(5), spacing=2.0, count=10).shape == (0, 3)
+
+
+def test_strength_seeds_sit_in_the_space_around_the_sources() -> None:
+    config = FieldLineConfig(max_lines=30)
+    seeds = seeds_for(config)
+    assert 0 < len(seeds) <= 30
+    sources = POSITIONS[[0, 1, 3]]
+    distance = np.linalg.norm(seeds[:, None] - sources[None], axis=2).min(axis=1)
+    assert distance.min() >= config.seed_clearance
+    assert distance.max() <= config.seed_shell
+    gaps = np.linalg.norm(seeds[:, None] - seeds[None], axis=2)[np.triu_indices(len(seeds), 1)]
+    assert gaps.min() >= config.seed_spacing
+
+
+def test_strength_seeds_start_where_the_field_is_strongest() -> None:
+    seeds = seeds_for(FieldLineConfig(max_lines=1, cutoff=None))
+    charges = np.array(CHARGES)
+    field = CoulombField(POSITIONS[[0, 1, 3]], charges[[0, 1, 3]])
+    candidates = grid_around(POSITIONS[[0, 1, 3]], 8.0, 3.0)
+    vectors, nearest = field.evaluate(candidates)
+    strengths = np.where(nearest >= 2.5, np.linalg.norm(vectors, axis=1), 0.0)
+    assert seeds[0] == pytest.approx(candidates[strengths.argmax()])
+
+
+def test_region_seeds_stay_near_the_region() -> None:
+    config = FieldLineConfig(region_atoms=(3,), seed_shell=5.0)
+    seeds = seeds_for(config)
+    assert len(seeds) > 0
+    assert np.linalg.norm(seeds - POSITIONS[3], axis=1).max() <= 5.0
+    assert len(seeds_for(config.updated(region_atoms=[]))) == 0
+
+
 def test_seeds_surround_the_chosen_atoms() -> None:
     config = FieldLineConfig(seed_atoms=(2, 0), seeds_per_atom=5, seed_radius=2.0)
-    seeds = make_seeds(POSITIONS, np.array(CHARGES), config)
+    seeds = seeds_for(config)
     assert seeds.shape == (10, 3)
     assert np.linalg.norm(seeds[:5] - POSITIONS[2], axis=1) == pytest.approx(2.0)
     assert np.linalg.norm(seeds[5:] - POSITIONS[0], axis=1) == pytest.approx(2.0)
 
 
 def test_seeds_default_to_the_most_charged_source_atoms() -> None:
-    charges = np.array(CHARGES)
-    seeds = make_seeds(POSITIONS, charges, FieldLineConfig(auto_seed_atoms=2, seeds_per_atom=1))
+    config = FieldLineConfig(seeding="atoms", auto_seed_atoms=2, seeds_per_atom=1)
+    seeds = seeds_for(config)
     assert np.linalg.norm(seeds - POSITIONS[[0, 1]], axis=1) == pytest.approx(1.5)
 
-    config = FieldLineConfig(auto_seed_atoms=2, seeds_per_atom=1, source_atoms=(1, 2, 3))
-    seeds = make_seeds(POSITIONS, charges, config)
+    seeds = seeds_for(config.updated(source_atoms=(1, 2, 3)))
     assert np.linalg.norm(seeds - POSITIONS[[1, 3]], axis=1) == pytest.approx(1.5)
 
 
 def test_seeds_are_thinned_to_the_line_limit() -> None:
     config = FieldLineConfig(seed_atoms=(0, 1, 2, 3), seeds_per_atom=10, max_lines=8)
-    seeds = make_seeds(POSITIONS, np.array(CHARGES), config)
+    seeds = seeds_for(config)
     assert len(seeds) == 8
     nearest_atom = np.linalg.norm(seeds[:, None] - POSITIONS[None], axis=2).argmin(axis=1)
     assert set(nearest_atom.tolist()) == {0, 1, 2, 3}
 
 
-@pytest.mark.parametrize("name", ["seed_atoms", "source_atoms"])
+def test_solvent_charges_do_not_shape_the_lines() -> None:
+    charges = np.array(CHARGES)
+    solvent = np.array([False, True, False, False])
+    config = FieldLineConfig(seed_atoms=(0,), cutoff=None)
+    without_solvent = trace_lines(POSITIONS, charges, config, solvent)
+    expected = trace_lines(POSITIONS, charges, config.updated(source_atoms=[0, 3]))
+    assert without_solvent.points == pytest.approx(expected.points)
+
+
+def test_a_constant_dielectric_scales_strengths_but_not_shapes() -> None:
+    charges = np.array(CHARGES)
+    config = FieldLineConfig(cutoff=None, max_lines=20)
+    vacuum = trace_lines(POSITIONS, charges, config)
+    damped = trace_lines(POSITIONS, charges, config.updated(dielectric=4.0))
+    assert len(vacuum) > 0
+    assert damped.points == pytest.approx(vacuum.points)
+    assert damped.strengths == pytest.approx(vacuum.strengths / 4.0)
+
+
+@pytest.mark.parametrize("name", ["seed_atoms", "source_atoms", "region_atoms"])
 @pytest.mark.parametrize("index", [-1, 4])
 def test_atom_indices_outside_the_system_are_rejected(name: str, index: int) -> None:
     config = FieldLineConfig().updated(**{name: [0, index]})
@@ -203,7 +330,13 @@ def test_short_lines_are_dropped() -> None:
 
 @pytest.mark.parametrize(
     "changes",
-    [{"source_atoms": [2]}, {"source_atoms": []}, {"seed_atoms": []}, {"auto_seed_atoms": 0}],
+    [
+        {"source_atoms": [2]},
+        {"source_atoms": []},
+        {"seed_atoms": []},
+        {"seeding": "atoms", "auto_seed_atoms": 0},
+        {"region_atoms": [], "seeding": "region"},
+    ],
 )
 def test_nothing_to_trace_gives_no_lines(changes: dict[str, object]) -> None:
     lines = trace_lines(POSITIONS, np.array(CHARGES), FieldLineConfig().updated(**changes))
@@ -247,6 +380,23 @@ def test_frames_carry_lines_that_match_the_positions(
     assert positions == pytest.approx(expected.points / 10.0, abs=1e-6)
 
 
+def test_the_service_leaves_out_solvent_from_the_topology(setup: ServerClientSetup) -> None:
+    residues = ["AR", "HOH", "AR", "AR"]
+    simulation = OpenMMSimulation.from_simulation(build_simulation(residues=residues))
+    simulation.reset(setup.app)
+    config = FieldLineConfig(cutoff=None)
+    FieldLineService(simulation, config)
+    simulation.advance_by_one_step()
+
+    frame = setup.server_current_frame
+    expected = trace_lines(
+        10.0 * np.asarray(frame.particle_positions, dtype=np.float64),
+        np.array(CHARGES),
+        config.updated(source_atoms=[0, 3]),
+    )
+    assert unpack(frame.frame_dict)[0] == pytest.approx(expected.points / 10.0, abs=1e-6)
+
+
 def test_lines_reach_the_client_as_bytes(
     setup: ServerClientSetup,
     simulation: OpenMMSimulation,
@@ -266,7 +416,7 @@ def test_lines_are_traced_every_stride_frames(
     traced = []
     original = service_module.trace_lines
 
-    def counting(*args: object) -> FieldLines:
+    def counting(*args: Any) -> FieldLines:  # noqa: ANN401
         assert simulation.simulation is not None
         traced.append(simulation.simulation.currentStep)
         return original(*args)
