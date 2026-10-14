@@ -16,9 +16,10 @@ from nanover.openmm import OpenMMSimulation
 from nanover.testing.servers import ServerClientSetup, make_connected_server_client_setup
 from openmm import app
 from openmm.unit import femtosecond, kelvin, nanometer, picosecond
+from scipy.spatial.transform import Rotation
 
 from nanover_extensions.fieldlines import service as service_module
-from nanover_extensions.fieldlines.core import CoulombField, FieldLines
+from nanover_extensions.fieldlines.core import CoulombField, FieldLines, GridField, Seeds
 from nanover_extensions.fieldlines.service import (
     COLORS_KEY,
     CONFIGURE_COMMAND,
@@ -29,8 +30,10 @@ from nanover_extensions.fieldlines.service import (
     fibonacci_sphere,
     get_charges,
     grid_around,
+    make_field,
     make_seeds,
     pack_lines,
+    potential_colors,
     seeding_mode,
     solvent_mask,
     source_indices,
@@ -92,7 +95,7 @@ class ImmediateExecutor(Executor):
         future: Future[T] = Future()
         try:
             future.set_result(fn(*args, **kwargs))
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             future.set_exception(error)
         return future
 
@@ -120,12 +123,19 @@ def attach(simulation: OpenMMSimulation, config: FieldLineConfig | None = None) 
     return FieldLineService(simulation, config, executor=ImmediateExecutor())
 
 
-def seeds_for(config: FieldLineConfig) -> np.ndarray:
+def seeds_for(config: FieldLineConfig, previous: np.ndarray | None = None) -> np.ndarray:
     """Return the seeds that `config` places around the test atoms."""
     charges = np.array(CHARGES)
     sources = source_indices(charges, config)
     field = CoulombField(POSITIONS[sources], charges[sources], cutoff=config.cutoff)
-    return make_seeds(POSITIONS, charges, sources, field, config)
+    seeds, _ = make_seeds(POSITIONS, charges, sources, field, config, previous=previous)
+    return seeds
+
+
+def seeds_of(lines: FieldLines) -> Seeds:
+    """Return the seeds that traced lines record."""
+    assert lines.seeds is not None
+    return lines.seeds
 
 
 def unpack(frame_dict: dict[str, bytes]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -171,6 +181,13 @@ def test_updated_changes_settings_and_converts_indices() -> None:
         {"weak_strength": 0.0},
         {"weak_strength": 10.0, "strong_strength": 5.0},
         {"colour": "red"},
+        {"field_method": "fft"},
+        {"coloring": "charge"},
+        {"cutoff": 12.0},
+        {"field_spacing": 0.0},
+        {"field_margin": -1.0},
+        {"min_strength": -1.0},
+        {"potential_limit": 0.0},
     ],
 )
 def test_invalid_settings_are_rejected(changes: dict[str, object]) -> None:
@@ -208,6 +225,17 @@ def test_strength_colors_span_the_scale_logarithmically() -> None:
     assert colors[0].tolist() == colors[1].tolist() == colors[2].tolist() == [38, 89, 255, 255]
     assert colors[4].tolist() == colors[5].tolist() == [255, 230, 51, 255]
     assert colors[3, :3] == pytest.approx((colors[2, :3] / 2 + colors[4, :3] / 2), abs=1)
+
+
+def test_potential_colors_run_from_red_through_white_to_blue() -> None:
+    colors = potential_colors(np.array([-9.0, -1.0, -0.5, 0.0, 0.5, 1.0, 9.0]), 1.0)
+    assert colors.dtype == np.uint8
+    assert colors[:, 3].tolist() == [255] * 7
+    assert colors[0].tolist() == colors[1].tolist() == [214, 31, 31, 255]
+    assert colors[3].tolist() == [255, 255, 255, 255]
+    assert colors[5].tolist() == colors[6].tolist() == [31, 64, 214, 255]
+    assert colors[2, :3] == pytest.approx((colors[1, :3] / 2 + 255 / 2), abs=1)
+    assert colors[4, :3] == pytest.approx((colors[5, :3] / 2 + 255 / 2), abs=1)
 
 
 def test_solvent_mask_marks_water_and_monovalent_ions() -> None:
@@ -256,17 +284,112 @@ def test_grid_covers_the_shell_around_the_centres() -> None:
     assert len(grid) == 2 * len(grid_around(centres[:1], shell=3.0, spacing=1.0))
 
 
+def test_grid_points_stay_put_when_the_centres_move() -> None:
+    centres = np.array([[0.3, -1.1, 2.0], [7.9, 4.2, -3.3]])
+    grid = grid_around(centres, shell=4.0, spacing=1.5)
+    assert grid / 1.5 == pytest.approx(np.round(grid / 1.5), abs=1e-12)
+    moved = grid_around(centres + [0.4, -0.2, 0.1], shell=4.0, spacing=1.5)
+    shared = {tuple(point) for point in grid} & {tuple(point) for point in moved}
+    assert len(shared) > 0.7 * len(grid)
+
+
+def test_spread_puts_the_first_points_before_the_rest() -> None:
+    points = np.array([[0.0, 0, 0], [1.0, 0, 0], [5.0, 0, 0], [9.0, 0, 0], [20.0, 0, 0]])
+    strengths = np.array([3.0, 5.0, 1.0, 2.0, 0.0])
+    first = np.array([True, False, True, False, True])
+    # Point 0 now blocks the stronger point 1, and point 4 has no field.
+    assert spread_strongest(points, strengths, 2.0, 10, first=first).tolist() == [0, 2, 3]
+
+
+def test_allowed_previous_seeds_are_kept() -> None:
+    config = FieldLineConfig(max_lines=5)
+    fresh = seeds_for(config)
+    # Off the grid, and weaker than every fresh seed.
+    weak = np.array([[0.3, -7.0, 0.2]])
+    kept = seeds_for(config, previous=weak)
+    assert kept[0] == pytest.approx(weak[0])
+    assert len(kept) == 5
+    # A previous seed outside the shell, or too close to an atom, is not kept.
+    for previous in (np.array([[100.0, 100.0, 100.0]]), POSITIONS[:1] + 0.5, np.zeros((0, 3))):
+        assert seeds_for(config, previous=previous) == pytest.approx(fresh)
+
+
+def test_kept_seeds_may_sit_closer_than_new_ones() -> None:
+    config = FieldLineConfig(max_lines=50)
+    # 3 angstrom apart: under `seed_spacing` (4) but over half of it.
+    close = np.array([[0.0, -6.0, 0.0], [3.0, -6.0, 0.0]])
+    seeds = seeds_for(config, previous=close)
+    assert seeds[:2] == pytest.approx(close)
+    gaps = np.linalg.norm(seeds[2:, None] - seeds[None], axis=2)
+    assert gaps[gaps > 0].min() >= config.seed_spacing
+    # Closer than half the spacing, only the stronger one stays.
+    closer = np.array([[0.0, -6.0, 0.0], [1.5, -6.0, 0.0]])
+    seeds = seeds_for(config, previous=closer)
+    assert sum(np.allclose(seed, point) for seed in seeds for point in closer) == 1
+
+
+def test_traced_lines_record_their_seeds_and_ids() -> None:
+    charges = np.array(CHARGES)
+    config = FieldLineConfig(max_lines=10)
+    lines = trace_lines(POSITIONS, charges, config)
+    seeds = seeds_of(lines)
+    field = make_field(POSITIONS, charges, np.array([0, 1, 3]), config)
+    expected, _ = make_seeds(POSITIONS, charges, np.array([0, 1, 3]), field, config)
+    assert seeds.points == pytest.approx(expected)
+    assert (seeds.ids.tolist(), seeds.next_id) == (list(range(len(seeds))), len(seeds))
+    assert lines.ids is not None
+    assert len(lines.ids) == len(lines)
+
+    again = trace_lines(POSITIONS, charges, config, previous_seeds=seeds)
+    assert seeds_of(again).points == pytest.approx(seeds.points)
+    assert seeds_of(again).ids.tolist() == seeds.ids.tolist()
+    assert again.points == pytest.approx(lines.points)
+
+
+def test_new_seeds_get_new_ids() -> None:
+    charges = np.array(CHARGES)
+    few = trace_lines(POSITIONS, charges, FieldLineConfig(max_lines=3))
+    more = trace_lines(POSITIONS, charges, FieldLineConfig(max_lines=8), previous_seeds=few.seeds)
+    assert seeds_of(more).ids.tolist() == list(range(8))
+    assert seeds_of(more).next_id == 8
+    # Seeds that are no longer allowed (here: outside a small region) leave their ids unused.
+    region = FieldLineConfig(region_atoms=(3,), seed_shell=3.0, max_lines=3)
+    elsewhere = trace_lines(POSITIONS, charges, region, previous_seeds=more.seeds)
+    assert seeds_of(elsewhere).ids.tolist() == [8, 9, 10]
+
+
+@pytest.mark.parametrize("seeding", ["strength", "region"])
+def test_kept_lines_move_with_the_molecule(seeding: str) -> None:
+    charges = np.array(CHARGES)
+    config = FieldLineConfig(seeding=seeding, region_atoms=(0, 1, 3), field_method="direct")
+    lines = trace_lines(POSITIONS, charges, config)
+    turn = Rotation.from_rotvec([0.0, 0.0, 0.7])
+    shift = np.array([3.3, -1.2, 5.6])
+    moved = trace_lines(turn.apply(POSITIONS) + shift, charges, config, previous_seeds=lines.seeds)
+    assert lines.ids is not None
+    assert moved.ids is not None
+    by_id = {int(i): points for i, (points, _) in zip(moved.ids, moved, strict=True)}
+    for line_id, (points, _) in zip(lines.ids, lines, strict=True):
+        assert by_id[int(line_id)] == pytest.approx(turn.apply(points) + shift, abs=1e-6)
+
+
+def test_atom_seeded_lines_are_numbered_in_order() -> None:
+    charges = np.array(CHARGES)
+    config = FieldLineConfig(seed_atoms=(0, 1), seeds_per_atom=3)
+    lines = trace_lines(POSITIONS, charges, config)
+    again = trace_lines(POSITIONS + 1.0, charges, config, previous_seeds=lines.seeds)
+    for seeds in (seeds_of(lines), seeds_of(again)):
+        assert (seeds.ids.tolist(), seeds.next_id) == (list(range(6)), 6)
+    assert seeds_of(again).points == pytest.approx(seeds_of(lines).points + 1.0)
+
+
 def test_spread_picks_the_strongest_points_apart() -> None:
     points = np.array([[0.0, 0, 0], [1.0, 0, 0], [5.0, 0, 0], [9.0, 0, 0], [20.0, 0, 0]])
     strengths = np.array([3.0, 5.0, 1.0, 2.0, 0.0])
-    picked = spread_strongest(points, strengths, spacing=2.0, count=10)
-    assert picked.tolist() == [[1.0, 0, 0], [9.0, 0, 0], [5.0, 0, 0]]
-    assert spread_strongest(points, strengths, spacing=2.0, count=2).tolist() == [
-        [1.0, 0, 0],
-        [9.0, 0, 0],
-    ]
-    assert spread_strongest(points, strengths, spacing=0.0, count=10).shape == (4, 3)
-    assert spread_strongest(points, np.zeros(5), spacing=2.0, count=10).shape == (0, 3)
+    assert spread_strongest(points, strengths, spacing=2.0, count=10).tolist() == [1, 3, 2]
+    assert spread_strongest(points, strengths, spacing=2.0, count=2).tolist() == [1, 3]
+    assert len(spread_strongest(points, strengths, spacing=0.0, count=10)) == 4
+    assert len(spread_strongest(points, np.zeros(5), spacing=2.0, count=10)) == 0
 
 
 def test_strength_seeds_sit_in_the_space_around_the_sources() -> None:
@@ -333,14 +456,82 @@ def test_solvent_charges_do_not_shape_the_lines() -> None:
     assert without_solvent.points == pytest.approx(expected.points)
 
 
-def test_a_constant_dielectric_scales_strengths_but_not_shapes() -> None:
+@pytest.mark.parametrize("method", ["grid", "direct"])
+def test_a_constant_dielectric_scales_strengths_but_not_shapes(method: str) -> None:
     charges = np.array(CHARGES)
-    config = FieldLineConfig(cutoff=None, max_lines=20)
+    # No lower strength limit, which would end the weaker lines sooner.
+    config = FieldLineConfig(field_method=method, max_lines=20, min_strength=0.0)
     vacuum = trace_lines(POSITIONS, charges, config)
     damped = trace_lines(POSITIONS, charges, config.updated(dielectric=4.0))
     assert len(vacuum) > 0
+    assert vacuum.potentials is not None
     assert damped.points == pytest.approx(vacuum.points)
     assert damped.strengths == pytest.approx(vacuum.strengths / 4.0)
+    assert damped.potentials == pytest.approx(vacuum.potentials / 4.0)
+
+
+def test_lines_end_where_the_field_is_weak() -> None:
+    charges = np.array(CHARGES)
+    config = FieldLineConfig(max_lines=20, min_strength=0.0)
+    full = trace_lines(POSITIONS, charges, config)
+    weak = np.percentile(full.strengths, 30)
+    cut = trace_lines(POSITIONS, charges, config.updated(min_strength=weak))
+    assert len(cut.points) < len(full.points)
+    # Lines are traced both ways from their seed, so only the two ends may be at or below
+    # the limit.
+    inner = np.ones(len(cut.points), dtype=bool)
+    inner[cut.offsets[:-1]] = False
+    inner[cut.offsets[1:] - 1] = False
+    assert cut.strengths[inner].min() > weak
+
+
+@pytest.mark.parametrize(
+    ("changes", "kind"),
+    [({}, GridField), ({"field_method": "direct"}, CoulombField)],
+)
+def test_the_field_method_picks_the_field(changes: dict[str, object], kind: type) -> None:
+    sources = np.array([0, 1, 3])
+    field = make_field(POSITIONS, np.array(CHARGES), sources, FieldLineConfig().updated(**changes))
+    assert isinstance(field, kind)
+    assert field.positions == pytest.approx(POSITIONS[sources])
+
+
+def test_the_direct_field_takes_the_settings() -> None:
+    config = FieldLineConfig(field_method="direct", cutoff=9.0, debye_length=None, dielectric=2.0)
+    field = make_field(POSITIONS, np.array(CHARGES), np.array([0, 1]), config)
+    assert isinstance(field, CoulombField)
+    assert (field.cutoff, field.debye_length, field.dielectric) == (9.0, None, 2.0)
+
+
+@pytest.mark.parametrize("name", ["region_atoms", "seed_atoms"])
+def test_the_grid_reaches_the_seeding_atoms(name: str) -> None:
+    # Atom 2 is 15 angstrom from the sources, beyond a 2 angstrom margin.
+    config = FieldLineConfig(field_margin=2.0).updated(**{name: [2]})
+    field = make_field(POSITIONS, np.array(CHARGES), np.array([0, 1]), config)
+    near_atom_2 = POSITIONS[2] - [1.0, 0.0, 0.0]
+    vectors, _ = field.evaluate([near_atom_2])
+    assert np.linalg.norm(vectors[0]) > 0
+    plain = make_field(
+        POSITIONS,
+        np.array(CHARGES),
+        np.array([0, 1]),
+        FieldLineConfig(field_margin=2.0),
+    )
+    assert plain.evaluate([near_atom_2])[0] == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize(("coloring", "has_potentials"), [("potential", True), ("strength", False)])
+def test_lines_carry_potentials_when_coloured_by_them(coloring: str, has_potentials: bool) -> None:  # noqa: FBT001
+    charges = np.array(CHARGES)
+    config = FieldLineConfig(max_lines=20, coloring=coloring)
+    lines = trace_lines(POSITIONS, charges, config)
+    assert (lines.potentials is not None) == has_potentials
+    if lines.potentials is not None:
+        field = make_field(POSITIONS, charges, np.array([0, 1, 3]), config)
+        assert lines.potentials == pytest.approx(field.potential(lines.points))
+        # Lines run from positive towards negative potential.
+        starts, ends = lines.offsets[:-1], lines.offsets[1:] - 1
+        assert np.all(lines.potentials[starts] > lines.potentials[ends])
 
 
 @pytest.mark.parametrize("name", ["seed_atoms", "source_atoms", "region_atoms"])
@@ -392,10 +583,23 @@ def test_packed_lines_are_in_nanometers_with_lengths_and_colors() -> None:
         strengths=np.array([1.0, 1.0, 1000.0, 1000.0, 1000.0]),
         offsets=np.array([0, 2, 5]),
     )
-    positions, lengths, colors = unpack(pack_lines(lines, FieldLineConfig()))
+    positions, lengths, colors = unpack(pack_lines(lines, FieldLineConfig(coloring="strength")))
     assert positions == pytest.approx(lines.points / 10.0)
     assert lengths.tolist() == [2, 3]
     assert colors.tolist() == [[38, 89, 255, 255]] * 2 + [[255, 230, 51, 255]] * 3
+
+
+def test_packed_lines_are_coloured_by_potential() -> None:
+    lines = FieldLines(
+        points=np.zeros((3, 3)),
+        strengths=np.ones(3),
+        offsets=np.array([0, 3]),
+        potentials=np.array([2.0, 0.0, -2.0]),
+    )
+    _, _, colors = unpack(pack_lines(lines, FieldLineConfig(potential_limit=2.0)))
+    assert colors.tolist() == [[31, 64, 214, 255], [255, 255, 255, 255], [214, 31, 31, 255]]
+    with pytest.raises(ValueError, match="potentials"):
+        pack_lines(FieldLines(lines.points, lines.strengths, lines.offsets), FieldLineConfig())
 
 
 # Service
@@ -470,6 +674,42 @@ def test_lines_are_traced_every_stride_frames(
     for _ in range(7):
         simulation.advance_by_one_step()
     assert traced == [1, 4, 7]
+
+
+@pytest.mark.parametrize("background", [True, False])
+def test_each_trace_starts_from_the_last_seeds(
+    simulation: OpenMMSimulation,
+    monkeypatch: pytest.MonkeyPatch,
+    background: bool,  # noqa: FBT001
+) -> None:
+    given: list[Seeds | None] = []
+    returned: list[Seeds | None] = []
+    original = service_module.trace_lines
+
+    def recording(*args: Any) -> FieldLines:  # noqa: ANN401
+        given.append(args[4])
+        lines = original(*args)
+        returned.append(lines.seeds)
+        return lines
+
+    monkeypatch.setattr(service_module, "trace_lines", recording)
+    service = attach(simulation, FieldLineConfig(background=background))
+    simulation.advance_by_one_step()
+    simulation.advance_by_one_step()
+    assert given[0] is None
+    assert given[1] is returned[0]
+    assert returned[0] is not None
+    assert len(returned[0]) > 0
+
+    # New settings start afresh, and `keep_seeds` can turn the reuse off.
+    service.configure(max_lines=50)
+    simulation.advance_by_one_step()
+    assert given[2] is None
+    service.configure(keep_seeds=False)
+    simulation.advance_by_one_step()
+    simulation.advance_by_one_step()
+    assert given[3] is None
+    assert given[4] is None
 
 
 def test_disabling_clears_the_lines_once(
