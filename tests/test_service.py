@@ -23,6 +23,7 @@ from nanover_extensions.fieldlines.core import CoulombField, FieldLines, GridFie
 from nanover_extensions.fieldlines.service import (
     COLORS_KEY,
     CONFIGURE_COMMAND,
+    IDS_KEY,
     LENGTHS_KEY,
     POSITIONS_KEY,
     FieldLineConfig,
@@ -138,12 +139,13 @@ def seeds_of(lines: FieldLines) -> Seeds:
     return lines.seeds
 
 
-def unpack(frame_dict: dict[str, bytes]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Decode the three field line entries of a frame."""
+def unpack(frame_dict: dict[str, bytes]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Decode the four field line entries of a frame."""
     return (
         np.frombuffer(frame_dict[POSITIONS_KEY], dtype=np.float32).reshape(-1, 3),
         np.frombuffer(frame_dict[LENGTHS_KEY], dtype=np.uint32),
         np.frombuffer(frame_dict[COLORS_KEY], dtype=np.uint8).reshape(-1, 4),
+        np.frombuffer(frame_dict[IDS_KEY], dtype=np.uint32),
     )
 
 
@@ -583,10 +585,24 @@ def test_packed_lines_are_in_nanometers_with_lengths_and_colors() -> None:
         strengths=np.array([1.0, 1.0, 1000.0, 1000.0, 1000.0]),
         offsets=np.array([0, 2, 5]),
     )
-    positions, lengths, colors = unpack(pack_lines(lines, FieldLineConfig(coloring="strength")))
+    positions, lengths, colors, ids = unpack(
+        pack_lines(lines, FieldLineConfig(coloring="strength"))
+    )
     assert positions == pytest.approx(lines.points / 10.0)
     assert lengths.tolist() == [2, 3]
     assert colors.tolist() == [[38, 89, 255, 255]] * 2 + [[255, 230, 51, 255]] * 3
+    assert ids.tolist() == [0, 1]
+
+
+def test_packed_lines_keep_their_ids() -> None:
+    lines = FieldLines(
+        points=np.zeros((6, 3)),
+        strengths=np.ones(6),
+        offsets=np.array([0, 3, 6]),
+        ids=np.array([7, 12]),
+    )
+    *_, ids = unpack(pack_lines(lines, FieldLineConfig(coloring="strength")))
+    assert ids.tolist() == [7, 12]
 
 
 def test_packed_lines_are_coloured_by_potential() -> None:
@@ -596,7 +612,7 @@ def test_packed_lines_are_coloured_by_potential() -> None:
         offsets=np.array([0, 3]),
         potentials=np.array([2.0, 0.0, -2.0]),
     )
-    _, _, colors = unpack(pack_lines(lines, FieldLineConfig(potential_limit=2.0)))
+    _, _, colors, _ = unpack(pack_lines(lines, FieldLineConfig(potential_limit=2.0)))
     assert colors.tolist() == [[31, 64, 214, 255], [255, 255, 255, 255], [214, 31, 31, 255]]
     with pytest.raises(ValueError, match="potentials"):
         pack_lines(FieldLines(lines.points, lines.strengths, lines.offsets), FieldLineConfig())
@@ -615,9 +631,10 @@ def test_frames_carry_lines_that_match_the_positions(
     simulation.advance_by_one_step()
 
     frame = setup.server_current_frame
-    positions, lengths, colors = unpack(frame.frame_dict)
+    positions, lengths, colors, ids = unpack(frame.frame_dict)
     assert len(lengths) > 0
     assert lengths.sum() == len(positions) == len(colors)
+    assert len(ids) == len(lengths)
     assert lengths.min() >= FieldLineConfig().min_points
 
     expected = trace_lines(
@@ -654,7 +671,9 @@ def test_lines_reach_the_client_as_bytes(
     setup.assert_frames_synced_soon()
     received = setup.client_current_frame.frame_dict
     assert isinstance(received[POSITIONS_KEY], bytes)
-    assert unpack(received)[1].sum() == len(unpack(received)[0])
+    positions, lengths, _, ids = unpack(received)
+    assert lengths.sum() == len(positions)
+    assert len(ids) == len(lengths)
 
 
 def test_lines_are_traced_every_stride_frames(
@@ -753,7 +772,7 @@ def test_clients_can_configure_with_a_command(
     assert service.config.cutoff == FieldLineConfig().cutoff
 
     simulation.advance_by_one_step()
-    positions, lengths, _ = unpack(setup.server_current_frame.frame_dict)
+    positions, lengths, _, _ = unpack(setup.server_current_frame.frame_dict)
     starts = 10.0 * positions[np.cumsum(lengths) - lengths]
     ends = 10.0 * positions[np.cumsum(lengths) - 1]
     atom = 10.0 * np.asarray(setup.server_current_frame.particle_positions[3])

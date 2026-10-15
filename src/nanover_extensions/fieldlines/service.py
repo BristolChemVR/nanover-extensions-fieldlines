@@ -1,13 +1,16 @@
 """Publish electric field lines for a running OpenMM simulation in NanoVer frames.
 
-The lines are added to the simulation's regular frames under three keys:
+The lines are added to the simulation's regular frames under four keys:
 
 - `fieldlines.positions`: float32 (M, 3), line vertices in nanometers.
 - `fieldlines.lengths`: uint32 (L,), number of vertices in each line.
 - `fieldlines.colors`: uint8 (M, 4), RGBA colour of each vertex, set by the potential
   (red negative, white zero, blue positive) or by the field strength.
+- `fieldlines.ids`: uint32 (L,), a number for each line. A line keeps its number from
+  one update to the next for as long as its seed is kept, so a client can match the
+  lines of two updates.
 
-All three are sent as raw bytes. Vertices of a line are ordered along the field
+All four are sent as raw bytes. Vertices of a line are ordered along the field
 direction (from positive towards negative charge).
 
 By default the field comes from every charged atom except water and monovalent ions,
@@ -49,6 +52,7 @@ logger = logging.getLogger(__name__)
 POSITIONS_KEY = "fieldlines.positions"
 LENGTHS_KEY = "fieldlines.lengths"
 COLORS_KEY = "fieldlines.colors"
+IDS_KEY = "fieldlines.ids"
 CONFIGURE_COMMAND = "fieldlines/configure"
 
 ANGSTROM_PER_NM = 10.0
@@ -639,10 +643,11 @@ def pack_lines(lines: FieldLines, config: FieldLineConfig) -> dict[str, bytes]:
 
     Args:
         lines: Lines in angstrom and MV/cm, with potentials if coloured by potential.
+            Lines without ids are numbered from 0.
         config: The settings that choose the colouring and its scale.
 
     Returns:
-        The three `fieldlines.*` frame entries.
+        The four `fieldlines.*` frame entries.
 
     Raises:
         ValueError: If the lines are coloured by potential but have no potentials.
@@ -654,10 +659,12 @@ def pack_lines(lines: FieldLines, config: FieldLineConfig) -> dict[str, bytes]:
         raise ValueError(msg)
     else:
         colors = potential_colors(lines.potentials, config.potential_limit)
+    ids = np.arange(len(lines)) if lines.ids is None else lines.ids
     return {
         POSITIONS_KEY: (lines.points / ANGSTROM_PER_NM).astype(np.float32).tobytes(),
         LENGTHS_KEY: np.diff(lines.offsets).astype(np.uint32).tobytes(),
         COLORS_KEY: colors.tobytes(),
+        IDS_KEY: ids.astype(np.uint32).tobytes(),
     }
 
 
