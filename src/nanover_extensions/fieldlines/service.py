@@ -13,6 +13,10 @@ The lines are added to the simulation's regular frames under four keys:
 All four are sent as raw bytes. Vertices of a line are ordered along the field
 direction (from positive towards negative charge).
 
+Clients draw the lines with the visualiser named by `field_lines_selection`, a
+selection to register with `OmniRunner.set_simulation_selections`. It holds no atoms,
+so the molecule is still drawn as before.
+
 By default the field comes from every charged atom except water and monovalent ions,
 screened as in salt water and computed on a grid, and lines start in the space around
 the molecule where the field is strongest.
@@ -27,6 +31,7 @@ from dataclasses import asdict, dataclass, fields, replace
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
+from nanover.app.selection import RenderingSelection
 from openmm import NonbondedForce, unit
 from scipy.spatial import cKDTree
 
@@ -54,6 +59,9 @@ LENGTHS_KEY = "fieldlines.lengths"
 COLORS_KEY = "fieldlines.colors"
 IDS_KEY = "fieldlines.ids"
 CONFIGURE_COMMAND = "fieldlines/configure"
+SELECTION_ID = "selection.fieldlines"
+RENDERER = "field lines"
+"""Name of the client's visualiser prefab that draws the `fieldlines.*` keys."""
 
 ANGSTROM_PER_NM = 10.0
 MIN_LINE_POINTS = 3
@@ -165,11 +173,11 @@ class FieldLineConfig:
     auto_seed_atoms: int = 8
     seeds_per_atom: int = 8
     seed_radius: float = 1.5
-    grid_spacing: float = 3.0
+    grid_spacing: float = 1.0
     seed_shell: float = 8.0
     seed_clearance: float = 2.5
-    seed_spacing: float = 4.0
-    max_lines: int = 200
+    seed_spacing: float = 3.0
+    max_lines: int = 800
     keep_seeds: bool = True
     field_method: str = "grid"
     field_spacing: float = 1.0
@@ -666,6 +674,22 @@ def pack_lines(lines: FieldLines, config: FieldLineConfig) -> dict[str, bytes]:
         COLORS_KEY: colors.tobytes(),
         IDS_KEY: ids.astype(np.uint32).tobytes(),
     }
+
+
+def field_lines_selection() -> RenderingSelection:
+    """Make the selection that asks clients to draw the field lines.
+
+    It holds no atoms and names the client's `field lines` visualiser, which reads the
+    `fieldlines.*` frame keys. Register it with `OmniRunner.set_simulation_selections`
+    so that it is sent again whenever the simulation is loaded.
+
+    Returns:
+        The selection.
+    """
+    selection = RenderingSelection(SELECTION_ID, "Field lines")
+    selection.renderer = RENDERER
+    selection.interaction_method = "none"
+    return selection
 
 
 @dataclass(frozen=True)

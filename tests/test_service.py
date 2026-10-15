@@ -12,6 +12,7 @@ from typing import Any, ParamSpec, TypeVar
 import numpy as np
 import openmm as mm
 import pytest
+from nanover.app import OmniRunner
 from nanover.openmm import OpenMMSimulation
 from nanover.testing.servers import ServerClientSetup, make_connected_server_client_setup
 from openmm import app
@@ -26,8 +27,11 @@ from nanover_extensions.fieldlines.service import (
     IDS_KEY,
     LENGTHS_KEY,
     POSITIONS_KEY,
+    RENDERER,
+    SELECTION_ID,
     FieldLineConfig,
     FieldLineService,
+    field_lines_selection,
     fibonacci_sphere,
     get_charges,
     grid_around,
@@ -317,7 +321,7 @@ def test_allowed_previous_seeds_are_kept() -> None:
 
 
 def test_kept_seeds_may_sit_closer_than_new_ones() -> None:
-    config = FieldLineConfig(max_lines=50)
+    config = FieldLineConfig(max_lines=50, seed_spacing=4.0, grid_spacing=3.0)
     # 3 angstrom apart: under `seed_spacing` (4) but over half of it.
     close = np.array([[0.0, -6.0, 0.0], [3.0, -6.0, 0.0]])
     seeds = seeds_for(config, previous=close)
@@ -781,6 +785,19 @@ def test_clients_can_configure_with_a_command(
         np.linalg.norm(ends - atom, axis=1),
     )
     assert np.any(near_atom <= 0.9)
+
+
+def test_the_selection_asks_clients_to_draw_the_lines(simulation: OpenMMSimulation) -> None:
+    runner = OmniRunner.with_basic_server(simulation, name="selection-test", port=0)
+    try:
+        runner.set_simulation_selections(simulation, field_lines_selection())
+        runner.load(0)
+        selection = runner.app_server.copy_state()[SELECTION_ID]
+    finally:
+        runner.close()
+    assert selection["selected"] == {"particle_ids": []}
+    assert selection["properties"]["nanover.rendering.renderer"] == RENDERER
+    assert selection["properties"]["nanover.interaction.method"] == "none"
 
 
 def test_configure_restarts_the_stride(simulation: OpenMMSimulation) -> None:
