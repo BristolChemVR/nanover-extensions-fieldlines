@@ -523,6 +523,9 @@ class FieldLines:
         seeds: The seeds the lines were traced from, if recorded. Lines that were
             dropped afterwards (for being too short) keep their seeds here.
         ids: The `seeds.ids` number of each line, shape (L,), if recorded.
+        seed_vertices: Index within each line of the vertex at its seed, shape (L,), if
+            recorded. Vertices are one step apart, so the seed marks the same place on a
+            line from one trace to the next.
     """
 
     points: FloatArray
@@ -531,6 +534,7 @@ class FieldLines:
     potentials: FloatArray | None = None
     seeds: Seeds | None = None
     ids: IndexArray | None = None
+    seed_vertices: IndexArray | None = None
 
     def __len__(self) -> int:
         return len(self.offsets) - 1
@@ -600,7 +604,7 @@ def trace(
         min_strength: Field magnitude (MV/cm) at or below which a line ends.
 
     Returns:
-        One line per seed, in seed order.
+        One line per seed, in seed order, with the index of each seed in its line.
     """
     seeds = _as_vectors(seeds, "seeds")
     if step <= 0:
@@ -608,7 +612,8 @@ def trace(
     if max_steps < 0:
         raise ValueError(f"`max_steps` must not be negative, not {max_steps}.")
     if len(seeds) == 0:
-        return FieldLines(np.zeros((0, 3)), np.zeros(0), np.zeros(1, dtype=np.intp))
+        no_lines = np.zeros(1, dtype=np.intp)
+        return FieldLines(np.zeros((0, 3)), np.zeros(0), no_lines, seed_vertices=no_lines[1:])
 
     halves = [
         _march(
@@ -632,7 +637,12 @@ def trace(
         points += [bwd_path[backward, k], fwd_path[forward, k]]
         strengths += [bwd_strength[backward, k], fwd_strength[forward, k]]
     offsets = np.concatenate([[0], np.cumsum(bwd_count - 1 + fwd_count)]).astype(np.intp)
-    return FieldLines(np.concatenate(points), np.concatenate(strengths), offsets)
+    return FieldLines(
+        np.concatenate(points),
+        np.concatenate(strengths),
+        offsets,
+        seed_vertices=(bwd_count - 1).astype(np.intp),
+    )
 
 
 def bond_field(

@@ -28,17 +28,22 @@ from nanover_extensions.fieldlines.service import (
     LENGTHS_KEY,
     POSITIONS_KEY,
     RENDERER,
+    SEEDS_KEY,
     SELECTION_ID,
     FieldLineConfig,
     FieldLineService,
     field_lines_selection,
     fibonacci_sphere,
+    direction_colors,
     get_charges,
     grid_around,
+    group_charges,
+    line_lengths,
     make_field,
     make_seeds,
     pack_lines,
     potential_colors,
+    residue_indices,
     seeding_mode,
     solvent_mask,
     source_indices,
@@ -194,6 +199,8 @@ def test_updated_changes_settings_and_converts_indices() -> None:
         {"field_margin": -1.0},
         {"min_strength": -1.0},
         {"potential_limit": 0.0},
+        {"charge_model": "molecules"},
+        {"min_length": -1.0},
     ],
 )
 def test_invalid_settings_are_rejected(changes: dict[str, object]) -> None:
@@ -345,6 +352,9 @@ def test_traced_lines_record_their_seeds_and_ids() -> None:
     assert (seeds.ids.tolist(), seeds.next_id) == (list(range(len(seeds))), len(seeds))
     assert lines.ids is not None
     assert len(lines.ids) == len(lines)
+    assert lines.seed_vertices is not None
+    starts = lines.points[lines.offsets[:-1] + lines.seed_vertices]
+    assert starts == pytest.approx(seeds.points[np.searchsorted(seeds.ids, lines.ids)])
 
     again = trace_lines(POSITIONS, charges, config, previous_seeds=seeds)
     assert seeds_of(again).points == pytest.approx(seeds.points)
@@ -567,6 +577,73 @@ def test_short_lines_are_dropped() -> None:
     assert len(trace_lines(POSITIONS, charges, short.updated(min_points=50))) == 0
 
 
+def test_line_lengths_are_measured_along_the_vertices() -> None:
+    points = np.array([[0.0, 0, 0], [3, 0, 0], [3, 4, 0], [9, 9, 9], [10, 9, 9]])
+    assert line_lengths(points, np.array([0, 3, 4, 5])) == pytest.approx([7.0, 0.0, 0.0])
+
+
+def test_lines_under_the_minimum_length_are_dropped() -> None:
+    charges = np.array(CHARGES)
+    config = FieldLineConfig(max_lines=20)
+    every = trace_lines(POSITIONS, charges, config)
+    lengths = line_lengths(every.points, every.offsets)
+    cut = float(np.median(lengths))
+    long = trace_lines(POSITIONS, charges, config.updated(min_length=cut))
+    assert 0 < len(long) < len(every)
+    assert line_lengths(long.points, long.offsets).min() >= cut
+    assert long.ids is not None
+    assert every.ids is not None
+    assert long.ids.tolist() == every.ids[lengths >= cut].tolist()
+
+
+# Residue charges
+
+GROUPS = np.array([0, 0, 1, 1])
+
+
+def test_group_charges_merge_each_group_at_its_charged_end() -> None:
+    charges = np.array([0.8, 0.4, 0.3, -0.3])
+    positions, net = group_charges(POSITIONS, charges, np.arange(4), GROUPS)
+    # Group 1 is neutral and left out.
+    assert net == pytest.approx([1.2])
+    assert positions == pytest.approx(np.array([(0.8 * POSITIONS[0] + 0.4 * POSITIONS[1]) / 1.2]))
+
+
+def test_the_residue_model_makes_the_field_from_residue_charges() -> None:
+    config = FieldLineConfig(charge_model="residues", field_method="direct")
+    charges = np.array([1.0, 0.5, 0.0, 0.5])
+    field = make_field(POSITIONS, charges, np.array([0, 1, 3]), config, GROUPS)
+    assert isinstance(field, CoulombField)
+    assert field.charges == pytest.approx([1.5, 0.5])
+    expected = np.array([(POSITIONS[0] + 0.5 * POSITIONS[1]) / 1.5, POSITIONS[3]])
+    assert field.positions == pytest.approx(expected)
+
+
+def test_residue_lines_follow_the_residue_field_and_keep_clear_of_atoms() -> None:
+    charges = np.array([1.0, 0.5, 0.0, -0.5])
+    config = FieldLineConfig(charge_model="residues", max_lines=20)
+    lines = trace_lines(POSITIONS, charges, config, residues=GROUPS)
+    assert len(lines) > 0
+    assert lines.potentials is not None
+    field = make_field(POSITIONS, charges, np.array([0, 1, 3]), config, GROUPS)
+    assert lines.potentials == pytest.approx(field.potential(lines.points))
+    seeds = seeds_of(lines).points
+    clearance = np.linalg.norm(seeds[:, None] - POSITIONS[[0, 1, 3]][None], axis=2).min(axis=1)
+    assert clearance.min() >= config.seed_clearance
+
+
+def test_the_residue_model_needs_residues() -> None:
+    config = FieldLineConfig(charge_model="residues")
+    with pytest.raises(ValueError, match="residue"):
+        trace_lines(POSITIONS, np.array(CHARGES), config)
+
+
+def test_neutral_residues_give_no_lines() -> None:
+    config = FieldLineConfig(charge_model="residues", source_atoms=(0, 1))
+    lines = trace_lines(POSITIONS, np.array(CHARGES), config, residues=GROUPS)
+    assert len(lines) == 0
+
+
 @pytest.mark.parametrize(
     "changes",
     [
@@ -596,6 +673,27 @@ def test_packed_lines_are_in_nanometers_with_lengths_and_colors() -> None:
     assert lengths.tolist() == [2, 3]
     assert colors.tolist() == [[38, 89, 255, 255]] * 2 + [[255, 230, 51, 255]] * 3
     assert ids.tolist() == [0, 1]
+    packed = pack_lines(lines, FieldLineConfig(coloring="strength"))
+    assert np.frombuffer(packed[SEEDS_KEY], dtype=np.uint32).tolist() == [0, 0]
+    with_seeds = FieldLines(
+        lines.points, lines.strengths, lines.offsets, seed_vertices=np.array([1, 2])
+    )
+    packed = pack_lines(with_seeds, FieldLineConfig(coloring="strength"))
+    assert np.frombuffer(packed[SEEDS_KEY], dtype=np.uint32).tolist() == [1, 2]
+
+
+def test_direction_colours_run_from_blue_to_red_along_each_line() -> None:
+    lines = FieldLines(
+        points=np.array([[0.0, 0, 0], [1, 0, 0], [4, 0, 0], [9, 9, 9], [5, 5, 5]]),
+        strengths=np.ones(5),
+        offsets=np.array([0, 3, 4, 5]),
+    )
+    _, _, colors, _ = unpack(pack_lines(lines, FieldLineConfig(coloring="direction")))
+    blue, red = np.array([31, 64, 214, 255]), np.array([214, 31, 31, 255])
+    # A quarter of the way along the first line; one-vertex lines stay blue.
+    expected = [blue, 0.75 * blue + 0.25 * red, red, blue, blue]
+    assert colors == pytest.approx(np.array(expected), abs=1)
+    assert direction_colors(np.zeros((0, 3)), np.zeros(1, dtype=np.intp)).shape == (0, 4)
 
 
 def test_packed_lines_keep_their_ids() -> None:
@@ -666,6 +764,27 @@ def test_the_service_leaves_out_solvent_from_the_topology(setup: ServerClientSet
     assert unpack(frame.frame_dict)[0] == pytest.approx(expected.points / 10.0, abs=1e-6)
 
 
+def test_the_service_groups_charges_by_the_topology_residues(
+    setup: ServerClientSetup,
+    simulation: OpenMMSimulation,
+) -> None:
+    config = FieldLineConfig(charge_model="residues", cutoff=None)
+    attach(simulation, config)
+    simulation.advance_by_one_step()
+
+    frame = setup.server_current_frame
+    residues = residue_indices(build_simulation().topology)
+    assert residues.tolist() == [0, 1, 2, 3]
+    expected = trace_lines(
+        10.0 * np.asarray(frame.particle_positions, dtype=np.float64),
+        np.array(CHARGES),
+        config,
+        residues=residues,
+    )
+    assert len(expected) > 0
+    assert unpack(frame.frame_dict)[0] == pytest.approx(expected.points / 10.0, abs=1e-6)
+
+
 def test_lines_reach_the_client_as_bytes(
     setup: ServerClientSetup,
     simulation: OpenMMSimulation,
@@ -678,6 +797,9 @@ def test_lines_reach_the_client_as_bytes(
     positions, lengths, _, ids = unpack(received)
     assert lengths.sum() == len(positions)
     assert len(ids) == len(lengths)
+    seeds = np.frombuffer(received[SEEDS_KEY], dtype=np.uint32)
+    assert len(seeds) == len(lengths)
+    assert np.all(seeds < lengths)
 
 
 def test_lines_are_traced_every_stride_frames(
@@ -687,10 +809,10 @@ def test_lines_are_traced_every_stride_frames(
     traced = []
     original = service_module.trace_lines
 
-    def counting(*args: Any) -> FieldLines:  # noqa: ANN401
+    def counting(*args: Any, **kwargs: Any) -> FieldLines:  # noqa: ANN401
         assert simulation.simulation is not None
         traced.append(simulation.simulation.currentStep)
-        return original(*args)
+        return original(*args, **kwargs)
 
     monkeypatch.setattr(service_module, "trace_lines", counting)
     attach(simulation, FieldLineConfig(stride=3))
@@ -709,9 +831,9 @@ def test_each_trace_starts_from_the_last_seeds(
     returned: list[Seeds | None] = []
     original = service_module.trace_lines
 
-    def recording(*args: Any) -> FieldLines:  # noqa: ANN401
+    def recording(*args: Any, **kwargs: Any) -> FieldLines:  # noqa: ANN401
         given.append(args[4])
-        lines = original(*args)
+        lines = original(*args, **kwargs)
         returned.append(lines.seeds)
         return lines
 

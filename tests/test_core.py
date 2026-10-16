@@ -116,6 +116,17 @@ def test_lines_are_returned_per_seed_in_order() -> None:
         assert np.linalg.norm(np.diff(points, axis=0), axis=1) == pytest.approx(0.25)
 
 
+def test_lines_record_where_their_seed_is() -> None:
+    seeds = np.array([[1.5, 0.0, 0.0], [0.0, 3.0, 0.0], [-2.5, 0.0, 0.5]])
+    lines = trace(dipole(), seeds, max_steps=20)
+    assert lines.seed_vertices is not None
+    assert lines.points[lines.offsets[:-1] + lines.seed_vertices] == pytest.approx(seeds)
+    # From x = 3 towards a charge at the origin: 9 steps back to x = 0.75.
+    point_charge = trace(CoulombField(ORIGIN, [1.0]), [[3.0, 0.0, 0.0]], max_steps=10)
+    assert point_charge.seed_vertices is not None
+    assert point_charge.seed_vertices.tolist() == [9]
+
+
 def test_bond_field_projects_on_the_bond_direction() -> None:
     field = dipole()
     on_axis = MV_PER_CM * (1 / 3.0**2 - 1 / 7.0**2)
@@ -427,6 +438,8 @@ def test_no_seeds() -> None:
     assert len(lines) == 0
     assert list(lines) == []
     assert lines.points.shape == (0, 3)
+    assert lines.seed_vertices is not None
+    assert lines.seed_vertices.shape == (0,)
 
 
 def test_seed_at_a_null_point_gives_a_single_point() -> None:

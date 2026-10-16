@@ -1,16 +1,21 @@
 """Publish electric field lines for a running OpenMM simulation in NanoVer frames.
 
-The lines are added to the simulation's regular frames under four keys:
+The lines are added to the simulation's regular frames under five keys:
 
 - `fieldlines.positions`: float32 (M, 3), line vertices in nanometers.
 - `fieldlines.lengths`: uint32 (L,), number of vertices in each line.
 - `fieldlines.colors`: uint8 (M, 4), RGBA colour of each vertex, set by the potential
-  (red negative, white zero, blue positive) or by the field strength.
+  (red negative, white zero, blue positive), by the field strength, or by the position
+  along the line (blue at its start, red at its end).
 - `fieldlines.ids`: uint32 (L,), a number for each line. A line keeps its number from
   one update to the next for as long as its seed is kept, so a client can match the
   lines of two updates.
+- `fieldlines.seeds`: uint32 (L,), index within each line of the vertex at its seed.
+  Vertices are one tracing step apart and a kept seed moves with its atoms, so a
+  client can line up the vertices of a line from two updates by their distance from
+  the seed, for example to move the line smoothly from one shape to the next.
 
-All four are sent as raw bytes. Vertices of a line are ordered along the field
+All five are sent as raw bytes. Vertices of a line are ordered along the field
 direction (from positive towards negative charge).
 
 Clients draw the lines with the visualiser named by `field_lines_selection`, a
@@ -19,7 +24,9 @@ so the molecule is still drawn as before.
 
 By default the field comes from every charged atom except water and monovalent ions,
 screened as in salt water and computed on a grid, and lines start in the space around
-the molecule where the field is strongest.
+the molecule where the field is strongest. With `charge_model="residues"`, each charged
+residue acts as one charge instead, which hides the atomic dipoles of the backbone and
+shows the larger pattern of positive and negative patches.
 """
 
 from __future__ import annotations
@@ -58,6 +65,7 @@ POSITIONS_KEY = "fieldlines.positions"
 LENGTHS_KEY = "fieldlines.lengths"
 COLORS_KEY = "fieldlines.colors"
 IDS_KEY = "fieldlines.ids"
+SEEDS_KEY = "fieldlines.seeds"
 CONFIGURE_COMMAND = "fieldlines/configure"
 SELECTION_ID = "selection.fieldlines"
 RENDERER = "field lines"
@@ -69,7 +77,11 @@ MIN_LINE_POINTS = 3
 
 SEEDING_MODES = ("auto", "strength", "region", "atoms")
 FIELD_METHODS = ("grid", "direct")
-COLORINGS = ("potential", "strength")
+COLORINGS = ("potential", "strength", "direction")
+CHARGE_MODELS = ("atoms", "residues")
+MIN_GROUP_CHARGE = 0.5
+"""Net charge (elementary charges) a residue needs to make the field when charges are
+grouped by residue. Neutral residues, whose partial charges cancel, are left out."""
 SOLVENT_RESIDUES = frozenset(
     {
         # Water models.
@@ -124,6 +136,11 @@ class FieldLineConfig:
             atoms except solvent (see `include_solvent`).
         include_solvent: Let water and monovalent ions make the field when
             `source_atoms` is None.
+        charge_model: What makes the field, one of `CHARGE_MODELS`: the partial charge
+            of every source atom (`atoms`), or one charge per residue (`residues`), its
+            net charge placed at the centre of its atoms weighted by their absolute
+            charges. Residues with a net charge under `MIN_GROUP_CHARGE` are left out.
+            Seeds still keep `seed_clearance` from every source atom.
         region_atoms: Atoms to start lines around in `region` mode.
         seed_atoms: Atoms to start lines around in `atoms` mode. If None, the
             `auto_seed_atoms` source atoms with the largest absolute charge are used.
@@ -153,7 +170,11 @@ class FieldLineConfig:
         max_steps: Maximum number of steps in each direction from a seed.
         min_strength: Field strength at (and below) which a line ends.
         min_points: Lines with fewer vertices than this are dropped.
-        coloring: What sets the colour of the lines, one of `COLORINGS`.
+        min_length: Lines shorter than this are dropped (UnityMol drops lines under 10
+            angstrom).
+        coloring: What sets the colour of the lines, one of `COLORINGS`. `direction`
+            fades each line from blue at its positive end to red at its negative end,
+            as UnityMol does, so every line shows which way the field points.
         potential_limit: Potential (plus or minus) at which the colour is fully blue or
             red when colouring by potential.
         weak_strength: Field strength at (and below) which lines get the weak colour
@@ -168,6 +189,7 @@ class FieldLineConfig:
     seeding: str = "auto"
     source_atoms: tuple[int, ...] | None = None
     include_solvent: bool = False
+    charge_model: str = "atoms"
     region_atoms: tuple[int, ...] | None = None
     seed_atoms: tuple[int, ...] | None = None
     auto_seed_atoms: int = 8
@@ -190,6 +212,7 @@ class FieldLineConfig:
     max_steps: int = 100
     min_strength: float = 5.0
     min_points: int = 6
+    min_length: float = 0.0
     coloring: str = "potential"
     potential_limit: float = 5.0
     weak_strength: float = 1.0
@@ -201,6 +224,7 @@ class FieldLineConfig:
             ("seeding", SEEDING_MODES),
             ("field_method", FIELD_METHODS),
             ("coloring", COLORINGS),
+            ("charge_model", CHARGE_MODELS),
         ):
             if getattr(self, name) not in allowed:
                 raise ValueError(f"`{name}` must be one of {allowed}, not {getattr(self, name)!r}.")
@@ -234,6 +258,7 @@ class FieldLineConfig:
             "seed_spacing",
             "field_margin",
             "min_strength",
+            "min_length",
         ):
             if getattr(self, name) < 0:
                 raise ValueError(f"`{name}` must not be negative, not {getattr(self, name)}.")
@@ -305,6 +330,57 @@ def solvent_mask(topology: Topology) -> BoolArray:
     return np.array([atom.residue.name in SOLVENT_RESIDUES for atom in topology.atoms()], bool)
 
 
+def residue_indices(topology: Topology) -> IndexArray:
+    """Return the index of each atom's residue, shape (N,)."""
+    return np.array([atom.residue.index for atom in topology.atoms()], dtype=np.intp)
+
+
+def group_charges(
+    positions: FloatArray,
+    charges: FloatArray,
+    sources: IndexArray,
+    groups: IndexArray,
+) -> tuple[FloatArray, FloatArray]:
+    """Merge the charges of the source atoms into one charge per group.
+
+    Each group's net charge sits at the centre of its source atoms, weighted by their
+    absolute charges, so a charged side chain's charge lands on its charged end. Groups
+    with a net charge under `MIN_GROUP_CHARGE` are left out.
+
+    Args:
+        positions: Atom positions, shape (N, 3).
+        charges: Atom charges, shape (N,).
+        sources: Indices of the charged source atoms.
+        groups: Group (such as residue) index of each atom, shape (N,).
+
+    Returns:
+        Positions (G, 3) and net charges (G,) of the charged groups.
+    """
+    _, group = np.unique(groups[sources], return_inverse=True)
+    net = np.bincount(group, weights=charges[sources])
+    weights = np.abs(charges[sources])
+    total = np.bincount(group, weights=weights)
+    centres = np.stack(
+        [np.bincount(group, weights=weights * positions[sources, axis]) for axis in range(3)],
+        axis=1,
+    )
+    keep = np.abs(net) >= MIN_GROUP_CHARGE
+    return centres[keep] / total[keep, None], np.asarray(net[keep], dtype=np.float64)
+
+
+def line_lengths(points: FloatArray, offsets: IndexArray) -> FloatArray:
+    """Return the length of each line along its vertices, shape (L,).
+
+    Args:
+        points: Vertices of all lines, shape (M, 3).
+        offsets: Index of each line's first vertex, and M at the end, shape (L + 1,).
+    """
+    steps = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    along = np.concatenate([[0.0], np.cumsum(steps)])
+    ends = np.maximum(offsets[1:] - 1, offsets[:-1])
+    return np.asarray(along[ends] - along[offsets[:-1]], dtype=np.float64)
+
+
 def fibonacci_sphere(count: int) -> FloatArray:
     """Return `count` points spread evenly over the unit sphere, shape (count, 3)."""
     index = np.arange(count) + 0.5
@@ -346,6 +422,28 @@ def potential_colors(potentials: FloatArray, limit: float) -> npt.NDArray[np.uin
     fraction = np.clip(potentials / limit, -1.0, 1.0)[:, None]
     end = np.where(fraction < 0, _NEGATIVE_COLOR, _POSITIVE_COLOR)
     rgb = _ZERO_COLOR + np.abs(fraction) * (end - _ZERO_COLOR)
+    rgba = np.concatenate([rgb, np.ones((len(rgb), 1))], axis=1)
+    return np.round(255.0 * rgba).astype(np.uint8)
+
+
+def direction_colors(points: FloatArray, offsets: IndexArray) -> npt.NDArray[np.uint8]:
+    """Colour each line from blue at its start to red at its end, by length along it.
+
+    Args:
+        points: Vertices of all lines, shape (M, 3).
+        offsets: Index of each line's first vertex, and M at the end, shape (L + 1,).
+
+    Returns:
+        Opaque colours, shape (M, 4).
+    """
+    steps = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    along = np.concatenate([[0.0], np.cumsum(steps)])[: len(points)]
+    counts = np.diff(offsets)
+    line = np.repeat(np.arange(len(counts)), counts)
+    start = along[offsets[:-1]][line]
+    length = line_lengths(points, offsets)[line]
+    fraction = np.divide(along - start, length, out=np.zeros(len(points)), where=length > 0)
+    rgb = (1.0 - fraction[:, None]) * _POSITIVE_COLOR + fraction[:, None] * _NEGATIVE_COLOR
     rgba = np.concatenate([rgb, np.ones((len(rgb), 1))], axis=1)
     return np.round(255.0 * rgba).astype(np.uint8)
 
@@ -523,7 +621,8 @@ def make_seeds(
         inside = np.flatnonzero(np.asarray(shell) <= config.seed_shell)
         candidates = np.concatenate([previous[inside], candidates])
         origin = np.concatenate([inside, origin])
-    clearance, _ = cKDTree(field.positions).query(candidates)
+    # From the atoms, not the field's charges, which may be merged residue charges.
+    clearance, _ = cKDTree(positions[sources]).query(candidates)
     admissible = np.asarray(clearance) >= config.seed_clearance
     candidates, origin = candidates[admissible], origin[admissible]
     vectors, _ = field.evaluate(candidates)
@@ -542,27 +641,70 @@ def make_seeds(
 _NO_LINES = FieldLines(np.zeros((0, 3)), np.zeros(0), np.zeros(1, dtype=np.intp), np.zeros(0))
 
 
+def field_charges(
+    positions: FloatArray,
+    charges: FloatArray,
+    sources: IndexArray,
+    config: FieldLineConfig,
+    residues: IndexArray | None = None,
+) -> tuple[FloatArray, FloatArray]:
+    """Return the positions and values of the charges that make the field.
+
+    Args:
+        positions: Atom positions in angstrom, shape (N, 3).
+        charges: Atom charges, shape (N,).
+        sources: Indices of the source atoms.
+        config: The settings that choose the charge model.
+        residues: Residue index of each atom, shape (N,). Needed for `residues` charges.
+
+    Returns:
+        Charge positions (C, 3) and charges (C,).
+
+    Raises:
+        ValueError: If charges are grouped by residue but `residues` is None.
+    """
+    if config.charge_model == "atoms":
+        return positions[sources], charges[sources]
+    if residues is None:
+        msg = "`charge_model='residues'` needs the residue of each atom."
+        raise ValueError(msg)
+    return group_charges(positions, charges, sources, residues)
+
+
 def make_field(
     positions: FloatArray,
     charges: FloatArray,
     sources: IndexArray,
     config: FieldLineConfig,
+    residues: IndexArray | None = None,
 ) -> Field:
-    """Build the field of the source atoms with the configured method.
+    """Build the field of the source atoms with the configured method and charge model.
 
     Args:
         positions: Atom positions in angstrom, shape (N, 3).
         charges: Atom charges, shape (N,).
         sources: Indices of the atoms that make the field, at least one.
-        config: The settings that choose the method and the medium.
+        config: The settings that choose the method, the charge model and the medium.
+        residues: Residue index of each atom, shape (N,). Needed for `residues` charges.
 
     Returns:
-        The field. A grid also reaches the region and seed atoms.
+        The field. A grid also reaches the source, region and seed atoms.
     """
+    charge_positions, charge_values = field_charges(positions, charges, sources, config, residues)
+    return _build_field(charge_positions, charge_values, positions, sources, config)
+
+
+def _build_field(
+    charge_positions: FloatArray,
+    charge_values: FloatArray,
+    positions: FloatArray,
+    sources: IndexArray,
+    config: FieldLineConfig,
+) -> Field:
     if config.field_method == "direct":
         return CoulombField(
-            positions[sources],
-            charges[sources],
+            charge_positions,
+            charge_values,
             debye_length=config.debye_length,
             cutoff=config.cutoff,
             dielectric=config.dielectric,
@@ -574,14 +716,15 @@ def make_field(
         if (atoms := getattr(config, name)) is not None
     ]
     return GridField(
-        positions[sources],
-        charges[sources],
+        charge_positions,
+        charge_values,
         debye_length=config.debye_length,
         dielectric=config.dielectric,
         distance_dielectric=config.distance_dielectric,
         spacing=config.field_spacing,
         margin=config.field_margin,
-        cover=positions[np.concatenate([np.zeros(0, dtype=np.intp), *seeding_atoms])],
+        # The source atoms too: merged charges sit inside their residues.
+        cover=positions[np.concatenate([sources, *seeding_atoms])],
     )
 
 
@@ -591,6 +734,8 @@ def trace_lines(
     config: FieldLineConfig,
     solvent: BoolArray | None = None,
     previous_seeds: Seeds | None = None,
+    *,
+    residues: IndexArray | None = None,
 ) -> FieldLines:
     """Trace the field lines of a set of atoms.
 
@@ -601,15 +746,20 @@ def trace_lines(
         solvent: True for each solvent atom, shape (N,). No atom is solvent if None.
         previous_seeds: Seeds of the last trace, moved with their atoms and kept where
             allowed, with their ids (see `make_seeds`). Ignored in `atoms` mode.
+        residues: Residue index of each atom, shape (N,). Needed for `residues` charges.
 
     Returns:
-        The lines with at least `config.min_points` vertices, in angstrom and MV/cm,
-        with potentials if coloured by potential, their seeds and their ids.
+        The lines with at least `config.min_points` vertices and `config.min_length`
+        length, in angstrom and MV/cm, with potentials if coloured by potential, their
+        seeds and their ids.
     """
     sources = source_indices(charges, config, solvent)
     if len(sources) == 0:
         return _NO_LINES
-    field = make_field(positions, charges, sources, config)
+    charge_positions, charge_values = field_charges(positions, charges, sources, config, residues)
+    if len(charge_values) == 0:
+        return _NO_LINES
+    field = _build_field(charge_positions, charge_values, positions, sources, config)
     previous = None if seeding_mode(config) == "atoms" else previous_seeds
     followed = None if previous is None else previous.follow(positions)
     points, origin = make_seeds(positions, charges, sources, field, config, previous=followed)
@@ -632,6 +782,8 @@ def trace_lines(
 
     lengths = np.diff(lines.offsets)
     keep = lengths >= config.min_points
+    if config.min_length > 0:
+        keep &= line_lengths(lines.points, lines.offsets) >= config.min_length
     vertices = np.repeat(keep, lengths)
     offsets = np.concatenate([[0], np.cumsum(lengths[keep])]).astype(np.intp)
     vertex_points = lines.points[vertices]
@@ -643,6 +795,7 @@ def trace_lines(
         potentials,
         seeds,
         seeds.ids[keep],
+        None if lines.seed_vertices is None else lines.seed_vertices[keep],
     )
 
 
@@ -655,24 +808,28 @@ def pack_lines(lines: FieldLines, config: FieldLineConfig) -> dict[str, bytes]:
         config: The settings that choose the colouring and its scale.
 
     Returns:
-        The four `fieldlines.*` frame entries.
+        The five `fieldlines.*` frame entries.
 
     Raises:
         ValueError: If the lines are coloured by potential but have no potentials.
     """
     if config.coloring == "strength":
         colors = strength_colors(lines.strengths, config.weak_strength, config.strong_strength)
+    elif config.coloring == "direction":
+        colors = direction_colors(lines.points, lines.offsets)
     elif lines.potentials is None:
         msg = "The lines have no potentials to colour them by."
         raise ValueError(msg)
     else:
         colors = potential_colors(lines.potentials, config.potential_limit)
     ids = np.arange(len(lines)) if lines.ids is None else lines.ids
+    seeds = np.zeros(len(lines)) if lines.seed_vertices is None else lines.seed_vertices
     return {
         POSITIONS_KEY: (lines.points / ANGSTROM_PER_NM).astype(np.float32).tobytes(),
         LENGTHS_KEY: np.diff(lines.offsets).astype(np.uint32).tobytes(),
         COLORS_KEY: colors.tobytes(),
         IDS_KEY: ids.astype(np.uint32).tobytes(),
+        SEEDS_KEY: seeds.astype(np.uint32).tobytes(),
     }
 
 
@@ -730,6 +887,7 @@ class FieldLineService:
         self._system: System | None = None
         self._charges: FloatArray = np.zeros(0)
         self._solvent: BoolArray = np.zeros(0, dtype=bool)
+        self._residues: IndexArray = np.zeros(0, dtype=np.intp)
         self._frames_until_trace = 0
         self._published = False
         self._executor = executor
@@ -829,9 +987,16 @@ class FieldLineService:
 
     def _trace_now(self, frame: FrameData, config: FieldLineConfig) -> None:
         try:
-            charges, solvent = self._system_data()
+            charges, solvent, residues = self._system_data()
             positions = self._positions(frame)
-            lines = trace_lines(positions, charges, config, solvent, self._previous_seeds(config))
+            lines = trace_lines(
+                positions,
+                charges,
+                config,
+                solvent,
+                self._previous_seeds(config),
+                residues=residues,
+            )
         except Exception:
             # A failed trace must not stop the simulation.
             logger.exception(_TRACE_FAILED)
@@ -840,7 +1005,7 @@ class FieldLineService:
 
     def _start(self, frame: FrameData, config: FieldLineConfig) -> None:
         try:
-            charges, solvent = self._system_data()
+            charges, solvent, residues = self._system_data()
             positions = self._positions(frame)  # A new array, so the trace owns it.
             future = self._get_executor().submit(
                 trace_lines,
@@ -849,6 +1014,7 @@ class FieldLineService:
                 config,
                 solvent,
                 self._previous_seeds(config),
+                residues=residues,
             )
         except Exception:
             logger.exception(_TRACE_FAILED)
@@ -887,11 +1053,12 @@ class FieldLineService:
     def _positions(frame: FrameData) -> FloatArray:
         return ANGSTROM_PER_NM * np.asarray(frame.particle_positions, dtype=np.float64)
 
-    def _system_data(self) -> tuple[FloatArray, BoolArray]:
-        """Charges and solvent atoms of the current system, read once per system."""
+    def _system_data(self) -> tuple[FloatArray, BoolArray, IndexArray]:
+        """Charges, solvent atoms and residues of the current system, read once per system."""
         simulation = cast("Simulation", self._simulation.simulation)
         if simulation.system is not self._system:
             self._charges = get_charges(simulation.system)
             self._solvent = solvent_mask(simulation.topology)
+            self._residues = residue_indices(simulation.topology)
             self._system = simulation.system
-        return self._charges, self._solvent
+        return self._charges, self._solvent, self._residues
